@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::WritableRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -16,8 +19,10 @@ use crate::compatibility_sandbox_policy_for_permission_profile;
 ///
 /// The elevated Windows backend consumes extra deny-read paths plus explicit
 /// read and write roots during setup/refresh. The unelevated restricted-token
-/// backend only consumes extra deny-write carveouts on top of the legacy
-/// `WorkspaceWrite` allow set. Read-root overrides are layered on top of the
+/// backend consumes extra deny-write carveouts on top of the legacy
+/// `WorkspaceWrite` allow set, plus deny-read paths for approved policies that
+/// write from the filesystem root (it runs those under a read-enforcing
+/// token). Read-root overrides are layered on top of the
 /// baseline helper roots that the elevated setup path needs to launch the
 /// sandboxed command; split policies that opt into platform defaults carry
 /// that explicitly with the override.
@@ -110,8 +115,8 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
 
     // The restricted-token backend can still enforce split write restrictions,
     // but its WRITE_RESTRICTED token does not make capability SID deny-read ACEs
-    // participate in read access checks. Read restrictions therefore require the
-    // elevated backend, even when the filesystem root remains readable.
+    // participate in read access checks. Read-root restrictions therefore
+    // require the elevated backend.
     if !windows_policy_has_root_read_access(&file_system_sandbox_policy, sandbox_policy_cwd) {
         return Err(
             "windows unelevated restricted-token sandbox cannot enforce split filesystem read restrictions directly; refusing to run unsandboxed"
@@ -124,9 +129,10 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
         sandbox_policy_cwd,
     )?;
     if !additional_deny_read_paths.is_empty() {
-        return Err(
-            "windows unelevated restricted-token sandbox cannot enforce deny-read restrictions directly; refusing to run unsandboxed"
-                .to_string(),
+        return read_enforcing_filesystem_overrides(
+            &file_system_sandbox_policy,
+            sandbox_policy_cwd,
+            additional_deny_read_paths,
         );
     }
 
@@ -382,6 +388,67 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     }))
 }
 
+/// Deny-read paths with a readable root. An approved policy that already
+/// writes from the filesystem root runs under the backend's read-enforcing
+/// token, which makes capability-SID deny ACEs apply to reads without adding
+/// any allow ACE. That token gives up capability-SID write confinement, so a
+/// scoped write policy still needs the elevated backend.
+fn read_enforcing_filesystem_overrides(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    sandbox_policy_cwd: &AbsolutePathBuf,
+    additional_deny_read_paths: Vec<AbsolutePathBuf>,
+) -> std::result::Result<Option<WindowsSandboxFilesystemOverrides>, String> {
+    let writable_roots = file_system_sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
+    // Only the symbolic `:root` write grant covers every volume and share. A
+    // write grant on one drive root would leave the rest only readable, which
+    // this token cannot confine.
+    if !has_symbolic_special_entry(file_system_sandbox_policy, |special, access| {
+        matches!(special, FileSystemSpecialPath::Root) && access.can_write()
+    }) || filesystem_root_write_root(&writable_roots).is_none()
+    {
+        return Err(
+            "windows unelevated restricted-token sandbox cannot enforce deny-read restrictions directly; refusing to run unsandboxed"
+                .to_string(),
+        );
+    }
+    if has_reopened_writable_descendant(&writable_roots) {
+        return Err(
+            "windows unelevated restricted-token sandbox cannot reopen writable descendants under read-only carveouts directly; refusing to run unsandboxed"
+                .to_string(),
+        );
+    }
+    // Temporary-directory denies resolve from this process's environment here,
+    // not the command's TEMP/TMP, so they could leave the command's temporary
+    // folders readable. Refuse rather than guess.
+    if has_symbolic_special_entry(file_system_sandbox_policy, |special, access| {
+        matches!(
+            special,
+            FileSystemSpecialPath::Tmpdir | FileSystemSpecialPath::SlashTmp
+        ) && !access.can_read()
+    }) {
+        return Err(
+            "windows unelevated restricted-token sandbox cannot enforce temporary-directory deny-read restrictions directly; refusing to run unsandboxed"
+                .to_string(),
+        );
+    }
+    // Every read-only carveout is enforced by a deny ACE for the session SID.
+    let additional_deny_write_paths = writable_roots
+        .iter()
+        .flat_map(|root| root.read_only_subpaths.iter())
+        .map(|path| normalize_windows_override_path(path.as_path()))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    Ok(Some(WindowsSandboxFilesystemOverrides {
+        read_roots_override: None,
+        read_roots_include_platform_defaults: false,
+        write_roots_override: None,
+        additional_deny_read_paths,
+        additional_deny_write_paths: additional_deny_write_paths
+            .into_iter()
+            .map(|path| AbsolutePathBuf::from_absolute_path(path).map_err(|err| err.to_string()))
+            .collect::<std::result::Result<_, _>>()?,
+    }))
+}
+
 fn normalize_windows_override_path(path: &Path) -> std::result::Result<PathBuf, String> {
     AbsolutePathBuf::from_absolute_path(dunce::simplified(path))
         .map(AbsolutePathBuf::into_path_buf)
@@ -414,6 +481,19 @@ fn filesystem_root_write_root(writable_roots: &[WritableRoot]) -> Option<&Path> 
         .iter()
         .map(|writable_root| writable_root.root.as_path())
         .find(|root| root.parent().is_none())
+}
+
+fn has_symbolic_special_entry(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    matches_entry: impl Fn(&FileSystemSpecialPath, FileSystemAccessMode) -> bool,
+) -> bool {
+    file_system_sandbox_policy
+        .entries
+        .iter()
+        .any(|entry| match &entry.path {
+            FileSystemPath::Special { value } => matches_entry(value, entry.access),
+            _ => false,
+        })
 }
 
 fn has_reopened_writable_descendant(writable_roots: &[WritableRoot]) -> bool {

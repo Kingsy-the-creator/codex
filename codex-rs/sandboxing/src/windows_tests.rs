@@ -120,3 +120,146 @@ fn elevated_root_write_with_retained_denied_read_is_refused_before_setup() {
     )
     .expect("scoped write with a retained denied read is enforceable");
 }
+
+#[test]
+fn unelevated_root_write_with_retained_denied_read_uses_read_enforcing_route() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(dir.path().join("work")).unwrap();
+    let private = dir.path().join("private");
+    std::fs::create_dir_all(cwd.as_path()).unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    let denied = FileSystemSandboxEntry::new(
+        AbsolutePathBuf::from_absolute_path(&private)
+            .unwrap()
+            .into(),
+        FileSystemAccessMode::Deny,
+    );
+    // Shape produced by `FileSystemSandboxPolicy::for_approved_command` for a
+    // baseline that carries a denied read: `:root` write plus the retained denial.
+    let approved = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Write,
+            ),
+            denied.clone(),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let overrides = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &approved,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect("root write with a retained denied read uses the read-enforcing token")
+    .expect("the denied read is passed to the backend");
+    let private_key = dunce::canonicalize(&private).unwrap();
+    assert!(
+        overrides.additional_deny_read_paths.iter().any(|path| {
+            dunce::canonicalize(path.as_path()).is_ok_and(|path| path == private_key)
+        }),
+        "{overrides:?}"
+    );
+    assert_eq!(overrides.read_roots_override, None);
+    assert_eq!(overrides.write_roots_override, None);
+
+    // A scoped write root would lose its confinement under that token.
+    let scoped = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+            denied,
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let err = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &scoped,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect_err("scoped write with a denied read still needs the elevated backend");
+    assert!(
+        err.contains("cannot enforce deny-read restrictions directly"),
+        "{err}"
+    );
+
+    // A write grant on one drive root is not `:root` write: other volumes and
+    // shares stay read-only, which the read-enforcing token cannot confine.
+    let drive_root = cwd.as_path().ancestors().last().unwrap().to_path_buf();
+    let drive_write = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(&drive_root)
+                    .unwrap()
+                    .into(),
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(&private)
+                    .unwrap()
+                    .into(),
+                FileSystemAccessMode::Deny,
+            ),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let err = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &drive_write,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect_err("a drive-root write grant must not use the read-enforcing token");
+    assert!(
+        err.contains("cannot enforce deny-read restrictions directly"),
+        "{err}"
+    );
+
+    // A temporary-directory deny resolves from this process, not the command.
+    let tmpdir_deny = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                FileSystemAccessMode::Deny,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(&private)
+                    .unwrap()
+                    .into(),
+                FileSystemAccessMode::Deny,
+            ),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let err = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &tmpdir_deny,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect_err("a temporary-directory deny must not use the read-enforcing token");
+    assert!(err.contains("refusing to run unsandboxed"), "{err}");
+}

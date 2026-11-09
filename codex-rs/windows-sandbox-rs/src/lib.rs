@@ -141,6 +141,8 @@ pub use runtime_ownership::save_installation;
 #[doc(hidden)]
 pub use service_diagnostics::ServiceStopReason;
 #[cfg(target_os = "windows")]
+mod read_enforcing;
+#[cfg(target_os = "windows")]
 mod resolved_permissions;
 #[cfg(target_os = "windows")]
 mod token;
@@ -557,6 +559,8 @@ mod windows_impl {
     use super::logging::log_success;
     use super::process::ConsoleMode;
     use super::process::create_process_as_user;
+    use super::read_enforcing::prepare_read_enforcing_session_security;
+    use super::read_enforcing::uses_read_enforcing_session;
     use super::sandbox_utils::ensure_codex_home_exists;
     use super::spawn_prep::LegacyAclSids;
     use super::spawn_prep::SpawnPrepOptions;
@@ -741,38 +745,58 @@ mod windows_impl {
         let current_dir = common.current_dir;
         let logs_base_dir = common.logs_base_dir.as_deref();
         let uses_write_capabilities = common.uses_write_capabilities;
-        if !permissions.has_full_disk_read_access() {
+        // Approved root-write commands with deny-read paths run under a
+        // read-enforcing token; see `read_enforcing`.
+        let read_enforcing = uses_read_enforcing_session(
+            &permissions,
+            &current_dir,
+            &env_map,
+            &additional_deny_read_paths,
+        );
+        if !read_enforcing && !permissions.has_full_disk_read_access() {
             anyhow::bail!(
                 "Restricted read-only access requires the elevated Windows sandbox backend"
             );
         }
         // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
         // backend cannot make capability-SID deny-read ACLs authoritative.
-        if !additional_deny_read_paths.is_empty() {
+        if !read_enforcing && !additional_deny_read_paths.is_empty() {
             anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
         }
-        let capability_roots =
-            legacy_session_capability_roots(&permissions, &current_dir, &env_map, codex_home);
-        let security = prepare_legacy_session_security(
-            uses_write_capabilities,
-            codex_home,
-            cwd,
-            capability_roots,
-        )?;
-        allow_null_device_for_workspace_write(uses_write_capabilities);
-        apply_legacy_session_acl_rules(
-            &permissions,
-            codex_home,
-            &current_dir,
-            &env_map,
-            &additional_deny_read_paths,
-            &additional_deny_write_paths,
-            LegacyAclSids {
-                readonly_sid: security.readonly_sid.as_ref(),
-                readonly_sid_str: security.readonly_sid_str.as_deref(),
-                write_root_sids: &security.write_root_sids,
-            },
-        )?;
+        let security = if read_enforcing {
+            prepare_read_enforcing_session_security(
+                &permissions,
+                codex_home,
+                &current_dir,
+                &env_map,
+                &additional_deny_read_paths,
+                &additional_deny_write_paths,
+            )?
+        } else {
+            let capability_roots =
+                legacy_session_capability_roots(&permissions, &current_dir, &env_map, codex_home);
+            let security = prepare_legacy_session_security(
+                uses_write_capabilities,
+                codex_home,
+                cwd,
+                capability_roots,
+            )?;
+            allow_null_device_for_workspace_write(uses_write_capabilities);
+            apply_legacy_session_acl_rules(
+                &permissions,
+                codex_home,
+                &current_dir,
+                &env_map,
+                &additional_deny_read_paths,
+                &additional_deny_write_paths,
+                LegacyAclSids {
+                    readonly_sid: security.readonly_sid.as_ref(),
+                    readonly_sid_str: security.readonly_sid_str.as_deref(),
+                    write_root_sids: &security.write_root_sids,
+                },
+            )?;
+            security
+        };
         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
         let spawn_res = crate::LaunchDesktop::prepare_legacy(

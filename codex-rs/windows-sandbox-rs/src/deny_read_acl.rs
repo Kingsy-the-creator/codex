@@ -1,4 +1,5 @@
 use crate::acl::add_deny_read_ace;
+use crate::acl::protect_read_denied_path;
 use crate::acl::revoke_ace;
 use anyhow::Context;
 use anyhow::Result;
@@ -55,6 +56,17 @@ pub(crate) fn lexical_path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// How a deny-read path is protected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DenyReadAceStyle {
+    /// A plain deny-read ACE, for tokens whose read checks never consult the
+    /// user SID through restricting SIDs (WRITE_RESTRICTED or sandbox users).
+    Read,
+    /// An OWNER RIGHTS ACE plus a deny of read, DACL, owner, delete and rename
+    /// rights, for read-enforcing tokens that carry the user as a restricting SID.
+    ReadAndControl,
+}
+
 /// Applies deny-read ACEs to explicit paths. Missing paths are materialized as
 /// directories before the ACE is applied so a sandboxed command cannot create a
 /// previously absent denied path and then read from it in the same run.
@@ -64,6 +76,18 @@ pub(crate) fn lexical_path_key(path: &Path) -> String {
 /// # Safety
 /// Caller must pass a valid SID pointer for the sandbox principal being denied.
 pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Result<Vec<PathBuf>> {
+    unsafe { apply_deny_read_acls_with_style(paths, psid, DenyReadAceStyle::Read) }
+}
+
+/// [`apply_deny_read_acls`] with an explicit ACE style.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer for the sandbox principal being denied.
+pub(crate) unsafe fn apply_deny_read_acls_with_style(
+    paths: &[PathBuf],
+    psid: *mut c_void,
+    style: DenyReadAceStyle,
+) -> Result<Vec<PathBuf>> {
     let planned = plan_deny_read_acl_paths(paths)?;
     let mut applied = Vec::new();
     let mut seen = HashSet::new();
@@ -74,8 +98,11 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
                 std::fs::create_dir_all(&path)
                     .with_context(|| format!("create deny-read path {}", path.display()))?;
             }
-            add_deny_read_ace(&path, psid)
-                .with_context(|| format!("apply deny-read ACE to {}", path.display()))
+            match style {
+                DenyReadAceStyle::Read => add_deny_read_ace(&path, psid),
+                DenyReadAceStyle::ReadAndControl => protect_read_denied_path(&path, psid),
+            }
+            .with_context(|| format!("apply deny-read ACE to {}", path.display()))
         })();
         let added = match result {
             Ok(added) => added,

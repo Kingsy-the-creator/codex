@@ -502,6 +502,60 @@ unsafe fn dacl_has_deny_mask(p_dacl: *mut ACL, scope: DenyAceScope, deny_mask: u
     false
 }
 
+/// True only when the effective (not inherit-only) deny ACEs for `psid`
+/// together deny every bit of `deny_mask`. Unlike [`dacl_has_deny_mask`], a
+/// deny ACE that shares only some bits (for example a control deny that
+/// overlaps a write deny on `WRITE_DAC`) does not count, so a combined deny is
+/// never skipped because a narrower one already exists.
+unsafe fn dacl_denies_all_of_mask(p_dacl: *mut ACL, psid: *mut c_void, deny_mask: u32) -> bool {
+    if p_dacl.is_null() {
+        return false;
+    }
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetAclInformation(
+            p_dacl as *const ACL,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let mut denied = 0u32;
+    for i in 0..info.AceCount {
+        let mut p_ace: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetAce(p_dacl as *const ACL, i, &mut p_ace) } == 0 {
+            continue;
+        }
+        let hdr = unsafe { &*(p_ace as *const ACE_HEADER) };
+        if hdr.AceType != ACCESS_DENIED_ACE_TYPE || (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let ace = unsafe { &*(p_ace as *const ACCESS_DENIED_ACE) };
+        if unsafe { EqualSid(std::ptr::addr_of!(ace.SidStart) as *mut c_void, psid) } == 0 {
+            continue;
+        }
+        let mut mapped = ace.Mask;
+        unsafe { MapGenericMask(&mut mapped, &mapping) };
+        denied |= mapped;
+    }
+    // Compare specific and standard rights only: generic bits may be stored
+    // mapped or unmapped, and are mapped on both sides here.
+    const GENERIC_BITS: u32 = 0xF000_0000;
+    let mut wanted = deny_mask;
+    unsafe { MapGenericMask(&mut wanted, &mapping) };
+    let wanted = wanted & !GENERIC_BITS;
+    (denied & !GENERIC_BITS & wanted) == wanted
+}
+
 // Grant DELETE on each inheriting descendant instead of FILE_DELETE_CHILD on
 // its parent. A parent delete-child grant would bypass a direct deny-write ACE
 // on protected children such as `.git` or an explicit read-only subpath.
@@ -839,12 +893,29 @@ pub unsafe fn add_deny_write_ace(path: &Path, psid: *mut c_void) -> Result<bool>
 enum DenyAceKind {
     Read,
     Write,
+    /// Deny reads and every right that would let the denied principal undo the
+    /// deny: DACL and owner changes, and delete or rename of the object.
+    ReadAndControl,
+    /// Deny writes plus DACL and owner changes, so a read-enforcing token
+    /// cannot undo a read-only carveout through the user's own rights.
+    WriteAndControl,
 }
 
+const DENY_CONTROL_MASK: u32 = WRITE_DAC | WRITE_OWNER | DELETE | FILE_DELETE_CHILD;
+
 impl DenyAceKind {
+    fn is_read(self) -> bool {
+        matches!(self, Self::Read | Self::ReadAndControl)
+    }
+
     fn mask(self) -> u32 {
         match self {
             Self::Read => FILE_GENERIC_READ | GENERIC_READ_MASK,
+            Self::ReadAndControl => FILE_GENERIC_READ | GENERIC_READ_MASK | DENY_CONTROL_MASK,
+            // Specific mutation rights only. `FILE_GENERIC_WRITE` and the
+            // generic-write bit also carry `READ_CONTROL` and `SYNCHRONIZE`,
+            // which a token without `WRITE_RESTRICTED` needs for ordinary reads.
+            Self::WriteAndControl => STANDARD_USER_MUTATION_MASK,
             Self::Write => {
                 FILE_GENERIC_WRITE
                     | FILE_WRITE_DATA
@@ -862,6 +933,9 @@ impl DenyAceKind {
         match self {
             Self::Read => dacl_has_read_deny_for_sid(p_dacl, psid),
             Self::Write => dacl_has_write_deny_for_sid(p_dacl, psid),
+            Self::ReadAndControl | Self::WriteAndControl => {
+                dacl_denies_all_of_mask(p_dacl, psid, self.mask())
+            }
         }
     }
 }
@@ -904,7 +978,7 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                 .open(path)
                 .with_context(|| format!("open deny ACL target {}", path.display()))?;
-            if matches!(kind, DenyAceKind::Read) {
+            if kind.is_read() {
                 ensure_handle_is_not_filesystem_root(&read_handle, path)?;
             }
             if deny_ace_already_present(&read_handle, path, psid, kind)? {
@@ -914,7 +988,7 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
                 .context("open deny ACL target for update (READ_CONTROL | WRITE_DAC)");
         }
     };
-    if matches!(kind, DenyAceKind::Read) {
+    if kind.is_read() {
         ensure_handle_is_not_filesystem_root(&handle, path)?;
     }
     let mut p_sd: *mut c_void = std::ptr::null_mut();
@@ -1013,6 +1087,98 @@ fn ensure_handle_is_not_filesystem_root(handle: &std::fs::File, path: &Path) -> 
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
 pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
     add_deny_ace(path, psid, DenyAceKind::Read)
+}
+
+/// SID string for OWNER RIGHTS. An ACE for it replaces the owner's implicit
+/// `READ_CONTROL | WRITE_DAC` with exactly the rights the ACE grants.
+pub const OWNER_RIGHTS_SID: &str = "S-1-3-4";
+
+/// Adds an inheritable OWNER RIGHTS ACE granting only `READ_CONTROL`, so the
+/// object owner no longer has implicit `WRITE_DAC`. Explicit ACEs still decide
+/// whether the owner can change the DACL.
+///
+/// # Safety
+/// `path` must refer to an existing file or directory.
+pub unsafe fn add_owner_rights_read_control_ace(path: &Path) -> Result<()> {
+    let handle = OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("open OWNER RIGHTS ACL target {}", path.display()))?;
+    ensure_handle_is_not_filesystem_root(&handle, path)?;
+    let owner_rights = crate::token::LocalSid::from_string(OWNER_RIGHTS_SID)?;
+    let mut p_sd: *mut c_void = std::ptr::null_mut();
+    let mut p_dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetSecurityInfo(
+        handle.as_raw_handle() as _,
+        1,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut p_dacl,
+        std::ptr::null_mut(),
+        &mut p_sd,
+    );
+    if let Err(err) = acl_api_result(path, "GetSecurityInfo", code) {
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
+        }
+        return Err(err);
+    }
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = READ_CONTROL;
+    explicit.grfAccessMode = SET_ACCESS;
+    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.Trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: owner_rights.as_ptr() as *mut u16,
+    };
+    let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
+    let code = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
+    let result = acl_api_result(path, "SetEntriesInAclW", code).and_then(|()| {
+        let code = SetSecurityInfo(
+            handle.as_raw_handle() as _,
+            1,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            p_new_dacl,
+            std::ptr::null_mut(),
+        );
+        acl_api_result(path, "SetSecurityInfo", code)
+    });
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
+    }
+    if !p_sd.is_null() {
+        LocalFree(p_sd as HLOCAL);
+    }
+    result
+}
+
+/// Protects a denied path for a read-enforcing token (see
+/// `token::create_read_enforcing_token_with_caps_and_user_from`): suppresses
+/// implicit owner rights, then denies `psid` reads and DACL, owner, delete and
+/// rename rights, inherited by existing and future children.
+///
+/// # Safety
+/// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
+pub unsafe fn protect_read_denied_path(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_owner_rights_read_control_ace(path)?;
+    add_deny_ace(path, psid, DenyAceKind::ReadAndControl)
+}
+
+/// Protects a read-only path for a read-enforcing token: suppresses implicit
+/// owner rights, then denies `psid` writes and DACL and owner changes.
+///
+/// # Safety
+/// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
+pub unsafe fn protect_write_denied_path(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_owner_rights_read_control_ace(path)?;
+    add_deny_ace(path, psid, DenyAceKind::WriteAndControl)
 }
 
 #[cfg(test)]

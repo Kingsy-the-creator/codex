@@ -1,0 +1,222 @@
+# Validation of the read-enforcing restricted token and its routing for
+# approved root-write commands that keep denied reads (unelevated backend only).
+# Key lines are echoed as annotations, which are public, because raw job logs
+# need a signed-in viewer.
+name: claudeai read-enforcing token spike
+on:
+  workflow_dispatch:
+  push:
+    branches: [claudeai-token-spike]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  windows:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
+      - name: Enable Git long paths and short Cargo/temp paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+          "TMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          cache-on-failure: true
+      # No local Rust toolchain wrote this code, so formatting is reported, not gated.
+      - name: Format report (not a gate)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo fmt -p codex-windows-sandbox -p codex-sandboxing
+          git diff --stat
+          git diff --stat | ForEach-Object { Write-Output "::notice title=rustfmt::$_" }
+          git diff | Out-File -FilePath ../rustfmt.diff -Encoding utf8
+          Write-Output '----- RUSTFMT DIFF BEGIN -----'
+          git --no-pager diff
+          Write-Output '----- RUSTFMT DIFF END -----'
+          git checkout -- .
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
+        shell: pwsh
+        run: |
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+      - name: Spike test (exactly one test must run and pass)
+        shell: pwsh
+        run: |
+          $name = 'token::tests::read_enforcing_token_keeps_denied_reads_without_new_allow_aces'
+          $out = cargo test -p codex-windows-sandbox --lib $name -- --exact --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0) { exit $code }
+          if (-not ($out -match 'test result: ok\. 1 passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+      - name: Read-enforcing module tests (all three must run and pass)
+        if: always()
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-windows-sandbox --lib read_enforcing::tests:: -- --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $out | Select-String -Pattern '^test |panicked|^Error:|RESIDUAL|test result' | Select-Object -First 12 | ForEach-Object { Write-Output "::notice title=read_enforcing::$($_.Line)" }
+          if ($code -ne 0) { exit $code }
+          if (-not ($out -match 'test result: ok\. 3 passed; 0 failed')) { Write-Output 'Expected exactly three read_enforcing module tests.'; exit 1 }
+      - name: Sandboxing Windows resolver tests
+        if: always()
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-sandboxing --lib windows 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=sandboxing::$($_.Line)" }
+          exit $code
+      - name: Existing token and ACL tests
+        if: always()
+        run: cargo test -p codex-windows-sandbox --lib token -- --nocapture
+      - name: Existing ACL and deny-read tests
+        if: always()
+        run: cargo test -p codex-windows-sandbox --lib -- acl deny_read
+      # A poisoned shared mutex masks seven legacy tests in the full suite; run
+      # each in its own process so every result is real.
+      - name: Legacy tests, one process each (reported)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $tests = @(
+            'legacy_capture_cancellation_terminates_descendants_without_timeout',
+            'legacy_capture_emits_output_and_preserves_descendant_after_normal_exit',
+            'legacy_non_tty_cmd_emits_output',
+            'legacy_non_tty_cmd_rejects_deny_read_overrides',
+            'legacy_non_tty_powershell_interrupt_terminates_process',
+            'legacy_tty_job_terminates_and_preserves_descendants',
+            'legacy_tty_powershell_emits_output_and_accepts_input',
+            'legacy_workspace_write_delete_is_limited_to_writable_roots'
+          )
+          $failed = 0
+          foreach ($t in $tests) {
+            $out = cargo test -p codex-windows-sandbox --lib "unified_exec::tests::$t" -- --exact 2>&1
+            $c = $LASTEXITCODE
+            $out | ForEach-Object { Write-Output $_ }
+            $why = ($out | Select-String -Pattern 'panicked at' -Context 0,1 | Select-Object -First 1 | ForEach-Object { ($_.Line + ' ' + ($_.Context.PostContext -join ' ')).Trim() })
+            Write-Output "LEGACY_EXACT $t exit=$c"
+            Write-Output "::notice title=legacy::$t exit=$c $why"
+            if ($c -ne 0) { $failed++ }
+          }
+          Write-Output "LEGACY_EXACT_FAILED=$failed"
+          if ($failed -ne 0) { exit 1 }
+      - name: Full Windows sandbox suite (reported; known legacy failures)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-windows-sandbox --lib 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $out | Select-String -Pattern '^test .* FAILED|^    [a-z_:]+$|test result' | Select-Object -First 10 | ForEach-Object { Write-Output "::notice title=full-suite::$($_.Line)" }
+          exit $code
+      - name: Clippy (reported)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = cargo clippy -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $lines = @($out | ForEach-Object { "$_" })
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^(error|warning)') {
+              $where = if ($i + 1 -lt $lines.Count) { $lines[$i + 1].Trim() } else { '' }
+              Write-Output "::warning title=clippy::$($lines[$i]) $where"
+            }
+          }
+          exit $code
+      - name: Keep the rustfmt report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudeai-token-spike-rustfmt
+          path: rustfmt.diff
+          if-no-files-found: ignore
+          retention-days: 7
+  # Same eight legacy tests, one process each, on the unmodified base commit,
+  # so a per-process failure can be attributed to the base or to this branch.
+  base-legacy:
+    # Attribution is recorded (same four failures on the base); rerun on demand.
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d18d77d3b10b268ed1925b8bb612249c414587ef
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Enable Git long paths and short Cargo/temp paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+          "TMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          cache-on-failure: true
+          key: base-d18d77d
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
+        shell: pwsh
+        run: |
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+      - name: Base legacy tests, one process each (reported)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $tests = @(
+            'legacy_capture_cancellation_terminates_descendants_without_timeout',
+            'legacy_capture_emits_output_and_preserves_descendant_after_normal_exit',
+            'legacy_non_tty_cmd_emits_output',
+            'legacy_non_tty_cmd_rejects_deny_read_overrides',
+            'legacy_non_tty_powershell_interrupt_terminates_process',
+            'legacy_tty_job_terminates_and_preserves_descendants',
+            'legacy_tty_powershell_emits_output_and_accepts_input',
+            'legacy_workspace_write_delete_is_limited_to_writable_roots'
+          )
+          $failed = 0
+          foreach ($t in $tests) {
+            $out = cargo test -p codex-windows-sandbox --lib "unified_exec::tests::$t" -- --exact 2>&1
+            $c = $LASTEXITCODE
+            $out | ForEach-Object { Write-Output $_ }
+            $why = ($out | Select-String -Pattern 'panicked at' -Context 0,1 | Select-Object -First 1 | ForEach-Object { ($_.Line + ' ' + ($_.Context.PostContext -join ' ')).Trim() })
+            Write-Output "::notice title=base-legacy::$t exit=$c $why"
+            if ($c -ne 0) { $failed++ }
+          }
+          Write-Output "::notice title=base-legacy::FAILED=$failed"
+          if ($failed -ne 0) { exit 1 }

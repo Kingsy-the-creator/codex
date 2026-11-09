@@ -465,10 +465,68 @@ unsafe fn create_token_with_caps_user_and_additional_restrictions_from(
     create_token_with_caps_from(base_token, psid_capabilities, &extra_restricting_sids)
 }
 
+/// Well-known groups that ordinary system and profile DACLs grant read and
+/// execute to. They must be restricting SIDs once restricting SIDs take part in
+/// read checks, or process start-up and normal reads fail in the second pass.
+/// Users, Authenticated Users, INTERACTIVE and RESTRICTED.
+const READ_ENFORCING_GROUP_SIDS: [&str; 4] = ["S-1-5-32-545", "S-1-5-11", "S-1-5-4", "S-1-5-12"];
+
+/// Create a restricted token for an approved broad command that must keep
+/// deny-read restrictions.
+///
+/// Unlike the other constructors this omits `WRITE_RESTRICTED`, so the
+/// restricting SIDs take part in every access check, reads included, and
+/// capability-SID deny-read ACEs become authoritative. The token user and the
+/// well-known groups in [`READ_ENFORCING_GROUP_SIDS`] are restricting SIDs, so
+/// the command keeps the signed-in user's own read and write rights and no new
+/// allow ACE (in particular none on a filesystem root) is needed.
+///
+/// Because the token user is a restricting SID, the command also holds the
+/// owner's implicit `READ_CONTROL | WRITE_DAC` on objects the user owns. Denied
+/// paths must therefore also carry an OWNER RIGHTS ACE and a deny ACE covering
+/// DACL changes (see `acl::protect_read_denied_path`), or the command could
+/// remove its own deny ACE.
+///
+/// # Safety
+/// Caller must close the returned token handle; base_token must be a valid primary token.
+pub unsafe fn create_read_enforcing_token_with_caps_and_user_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+) -> Result<HANDLE> {
+    let mut user_sid_bytes = get_user_sid_bytes(base_token)?;
+    let groups = READ_ENFORCING_GROUP_SIDS
+        .iter()
+        .map(|sid| LocalSid::from_string(sid))
+        .collect::<Result<Vec<_>>>()?;
+    let mut extra_restricting_sids = Vec::with_capacity(groups.len() + 1);
+    extra_restricting_sids.push(user_sid_bytes.as_mut_ptr() as *mut c_void);
+    extra_restricting_sids.extend(groups.iter().map(LocalSid::as_ptr));
+    create_token_with_caps_and_flags_from(
+        base_token,
+        psid_capabilities,
+        &extra_restricting_sids,
+        DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+    )
+}
+
 unsafe fn create_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
     extra_restricting_sids: &[*mut c_void],
+) -> Result<HANDLE> {
+    create_token_with_caps_and_flags_from(
+        base_token,
+        psid_capabilities,
+        extra_restricting_sids,
+        DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+    )
+}
+
+unsafe fn create_token_with_caps_and_flags_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+    extra_restricting_sids: &[*mut c_void],
+    flags: u32,
 ) -> Result<HANDLE> {
     if psid_capabilities.is_empty() {
         return Err(anyhow!("no capability SIDs provided"));
@@ -497,7 +555,6 @@ unsafe fn create_token_with_caps_from(
     entries[logon_idx + 1].Attributes = 0;
 
     let mut new_token: HANDLE = std::ptr::null_mut();
-    let flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED;
     let ok = CreateRestrictedToken(
         base_token,
         flags,

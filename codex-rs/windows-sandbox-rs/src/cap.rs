@@ -30,6 +30,13 @@ pub struct CapSids {
     /// later workspace sandboxes.
     #[serde(default)]
     pub writable_root_by_path: HashMap<String, String>,
+    /// Read-enforcing session capability SIDs keyed by protection set (root,
+    /// denied-read paths and read-only paths).
+    ///
+    /// A deny ACE for one of these SIDs only affects tokens that hold it, so a
+    /// session never revokes or keeps a deny that another protection set needs.
+    #[serde(default)]
+    pub read_enforcing_by_set: HashMap<String, String>,
 }
 
 pub fn cap_sid_file(codex_home: &Path) -> PathBuf {
@@ -70,6 +77,7 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
                 readonly: make_random_cap_sid_string(),
                 workspace_by_cwd: HashMap::new(),
                 writable_root_by_path: HashMap::new(),
+                read_enforcing_by_set: HashMap::new(),
             };
             persist_caps(&path, &caps)?;
             return Ok(caps);
@@ -80,6 +88,7 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
         readonly: make_random_cap_sid_string(),
         workspace_by_cwd: HashMap::new(),
         writable_root_by_path: HashMap::new(),
+        read_enforcing_by_set: HashMap::new(),
     };
     persist_caps(&path, &caps)?;
     Ok(caps)
@@ -109,6 +118,22 @@ pub fn writable_root_cap_sid_for_path(codex_home: &Path, root: &Path) -> Result<
     }
     let sid = make_random_cap_sid_string();
     caps.writable_root_by_path.insert(key, sid.clone());
+    persist_caps(&path, &caps)?;
+    Ok(sid)
+}
+
+/// Returns the read-enforcing capability SID for one protection set, creating
+/// and persisting it if missing. `set_key` must identify the filesystem root,
+/// the denied-read paths and the read-only paths.
+pub fn read_enforcing_cap_sid_for_set(codex_home: &Path, set_key: &str) -> Result<String> {
+    let path = cap_sid_file(codex_home);
+    let mut caps = load_or_create_cap_sids(codex_home)?;
+    if let Some(sid) = caps.read_enforcing_by_set.get(set_key) {
+        return Ok(sid.clone());
+    }
+    let sid = make_random_cap_sid_string();
+    caps.read_enforcing_by_set
+        .insert(set_key.to_string(), sid.clone());
     persist_caps(&path, &caps)?;
     Ok(sid)
 }

@@ -10,6 +10,8 @@ use crate::process::StderrMode;
 use crate::process::StdinMode;
 use crate::process::read_handle_loop;
 use crate::process::spawn_process_with_pipes;
+use crate::read_enforcing::prepare_read_enforcing_session_security;
+use crate::read_enforcing::uses_read_enforcing_session;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::spawn_prep::LegacyAclSids;
 use crate::spawn_prep::LegacySessionSecurity;
@@ -355,45 +357,69 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
             add_git_safe_directory: false,
         },
     )?;
-    if !common.permissions.has_full_disk_read_access() {
+    let additional_deny_read_paths = additional_deny_read_paths
+        .iter()
+        .map(AbsolutePathBuf::to_path_buf)
+        .collect::<Vec<_>>();
+    // Approved root-write commands with deny-read paths run under a
+    // read-enforcing token; see `read_enforcing`.
+    let read_enforcing = uses_read_enforcing_session(
+        &common.permissions,
+        &common.current_dir,
+        &env_map,
+        &additional_deny_read_paths,
+    );
+    if !read_enforcing && !common.permissions.has_full_disk_read_access() {
         anyhow::bail!("Restricted read-only access requires the elevated Windows sandbox backend");
     }
     // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
     // backend cannot make capability-SID deny-read ACLs authoritative.
-    if !additional_deny_read_paths.is_empty() {
+    if !read_enforcing && !additional_deny_read_paths.is_empty() {
         anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
     }
     let additional_deny_write_paths = additional_deny_write_paths
         .iter()
         .map(AbsolutePathBuf::to_path_buf)
         .collect::<Vec<_>>();
-    let capability_roots = legacy_session_capability_roots(
-        &common.permissions,
-        &common.current_dir,
-        &env_map,
-        codex_home,
-    );
-    let security = prepare_legacy_session_security(
-        common.uses_write_capabilities,
-        codex_home,
-        cwd,
-        capability_roots,
-    )?;
-    allow_null_device_for_workspace_write(common.uses_write_capabilities);
+    let security = if read_enforcing {
+        prepare_read_enforcing_session_security(
+            &common.permissions,
+            codex_home,
+            &common.current_dir,
+            &env_map,
+            &additional_deny_read_paths,
+            &additional_deny_write_paths,
+        )?
+    } else {
+        let capability_roots = legacy_session_capability_roots(
+            &common.permissions,
+            &common.current_dir,
+            &env_map,
+            codex_home,
+        );
+        let security = prepare_legacy_session_security(
+            common.uses_write_capabilities,
+            codex_home,
+            cwd,
+            capability_roots,
+        )?;
+        allow_null_device_for_workspace_write(common.uses_write_capabilities);
 
-    apply_legacy_session_acl_rules(
-        &common.permissions,
-        codex_home,
-        &common.current_dir,
-        &env_map,
-        &[],
-        &additional_deny_write_paths,
-        LegacyAclSids {
-            readonly_sid: security.readonly_sid.as_ref(),
-            readonly_sid_str: security.readonly_sid_str.as_deref(),
-            write_root_sids: &security.write_root_sids,
-        },
-    )?;
+        apply_legacy_session_acl_rules(
+            &common.permissions,
+            codex_home,
+            &common.current_dir,
+            &env_map,
+            &[],
+            &additional_deny_write_paths,
+            LegacyAclSids {
+                readonly_sid: security.readonly_sid.as_ref(),
+                readonly_sid_str: security.readonly_sid_str.as_deref(),
+                write_root_sids: &security.write_root_sids,
+            },
+        )?;
+        security
+    };
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(256);
