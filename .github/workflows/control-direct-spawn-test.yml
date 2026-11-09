@@ -40,4 +40,9 @@ jobs:
           if (Select-String -Path windows-sandbox-rs/src/setup.rs -Pattern 'validate_refresh_write_roots' -Quiet) { throw 'guard present' }
           Write-Host 'unpatched base confirmed'
       - name: Run the one pre-existing test on the unpatched base
-        run: cargo test -p codex-sandboxing --lib transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-sandboxing --lib manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture 2>&1 | Tee-Object -Variable log
+          $out
+          if (-not ($log -match "running 1 test")) { throw "expected exactly one test to run; refusing a zero-test result" }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
