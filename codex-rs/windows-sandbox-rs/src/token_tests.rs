@@ -1,4 +1,5 @@
 use super::*;
+use crate::read_enforcing::file_access_allowed;
 use pretty_assertions::assert_eq;
 use windows_sys::Win32::Security::EqualSid;
 use windows_sys::Win32::Security::TokenRestrictedSids;
@@ -315,70 +316,6 @@ fn unique_capability_sid() -> String {
         .map(|elapsed| elapsed.subsec_nanos())
         .unwrap_or(0);
     format!("S-1-5-21-{}-{nanos}-4242-77", std::process::id())
-}
-
-/// `AccessCheck` of `desired` on a file for an impersonation copy of `token`.
-unsafe fn file_access_allowed(path: &std::path::Path, token: HANDLE, desired: u32) -> Result<bool> {
-    use windows_sys::Win32::Security::AccessCheck;
-    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
-    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
-    use windows_sys::Win32::Security::DuplicateToken;
-    use windows_sys::Win32::Security::GENERIC_MAPPING;
-    use windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION;
-    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
-    use windows_sys::Win32::Security::SecurityImpersonation;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
-    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
-    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
-
-    let mut sd: *mut c_void = std::ptr::null_mut();
-    let code = GetNamedSecurityInfoW(
-        to_wide(path).as_ptr(),
-        1, // SE_FILE_OBJECT
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut sd,
-    );
-    ensure!(
-        code == ERROR_SUCCESS,
-        "GetNamedSecurityInfoW({}) failed: {code}",
-        path.display()
-    );
-    let mut impersonation: HANDLE = std::ptr::null_mut();
-    if DuplicateToken(token, SecurityImpersonation, &mut impersonation) == 0 {
-        let err = GetLastError();
-        LocalFree(sd as HLOCAL);
-        return Err(anyhow!("DuplicateToken failed: {err}"));
-    }
-    let mapping = GENERIC_MAPPING {
-        GenericRead: FILE_GENERIC_READ,
-        GenericWrite: FILE_GENERIC_WRITE,
-        GenericExecute: FILE_GENERIC_EXECUTE,
-        GenericAll: FILE_ALL_ACCESS,
-    };
-    let mut privileges = [0u64; 128];
-    let mut privilege_bytes = std::mem::size_of_val(&privileges) as u32;
-    let mut granted = 0;
-    let mut allowed = 0;
-    let ok = AccessCheck(
-        sd,
-        impersonation,
-        desired,
-        &mapping,
-        privileges.as_mut_ptr().cast(),
-        &mut privilege_bytes,
-        &mut granted,
-        &mut allowed,
-    );
-    let err = GetLastError();
-    CloseHandle(impersonation);
-    LocalFree(sd as HLOCAL);
-    ensure!(ok != 0, "AccessCheck({}) failed: {err}", path.display());
-    Ok(allowed != 0)
 }
 
 /// Runs the probe script in a child created with `token` and returns the

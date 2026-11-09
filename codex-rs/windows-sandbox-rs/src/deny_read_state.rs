@@ -1,5 +1,6 @@
 use crate::acl::revoke_ace;
-use crate::deny_read_acl::apply_deny_read_acls;
+use crate::deny_read_acl::DenyReadAceStyle;
+use crate::deny_read_acl::apply_deny_read_acls_with_style;
 use crate::deny_read_acl::lexical_path_key;
 use crate::setup::sandbox_dir;
 use anyhow::Context;
@@ -49,6 +50,28 @@ pub unsafe fn sync_persistent_deny_read_acls(
     desired_paths: &[PathBuf],
     psid: *mut c_void,
 ) -> Result<Vec<PathBuf>> {
+    unsafe {
+        sync_persistent_deny_read_acls_with_style(
+            codex_home,
+            principal_sid,
+            desired_paths,
+            psid,
+            DenyReadAceStyle::Read,
+        )
+    }
+}
+
+/// [`sync_persistent_deny_read_acls`] with an explicit ACE style.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer matching `principal_sid`.
+pub(crate) unsafe fn sync_persistent_deny_read_acls_with_style(
+    codex_home: &Path,
+    principal_sid: &str,
+    desired_paths: &[PathBuf],
+    psid: *mut c_void,
+    style: DenyReadAceStyle,
+) -> Result<Vec<PathBuf>> {
     let state_path = sandbox_dir(codex_home).join(DENY_READ_ACL_STATE_FILE);
     let mut state = load_state(&state_path)?;
     let previous_paths = state
@@ -57,7 +80,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .cloned()
         .unwrap_or_default();
 
-    let applied_paths = unsafe { apply_deny_read_acls(desired_paths, psid) }?;
+    let applied_paths = unsafe { apply_deny_read_acls_with_style(desired_paths, psid, style) }?;
     let desired_keys = applied_paths
         .iter()
         .map(|path| lexical_path_key(path))

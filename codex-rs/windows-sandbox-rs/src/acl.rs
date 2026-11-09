@@ -842,6 +842,9 @@ enum DenyAceKind {
     /// Deny reads and every right that would let the denied principal undo the
     /// deny: DACL and owner changes, and delete or rename of the object.
     ReadAndControl,
+    /// Deny writes plus DACL and owner changes, so a read-enforcing token
+    /// cannot undo a read-only carveout through the user's own rights.
+    WriteAndControl,
 }
 
 const DENY_CONTROL_MASK: u32 = WRITE_DAC | WRITE_OWNER | DELETE | FILE_DELETE_CHILD;
@@ -855,6 +858,7 @@ impl DenyAceKind {
         match self {
             Self::Read => FILE_GENERIC_READ | GENERIC_READ_MASK,
             Self::ReadAndControl => FILE_GENERIC_READ | GENERIC_READ_MASK | DENY_CONTROL_MASK,
+            Self::WriteAndControl => Self::Write.mask() | WRITE_DAC | WRITE_OWNER,
             Self::Write => {
                 FILE_GENERIC_WRITE
                     | FILE_WRITE_DATA
@@ -872,7 +876,7 @@ impl DenyAceKind {
         match self {
             Self::Read => dacl_has_read_deny_for_sid(p_dacl, psid),
             Self::Write => dacl_has_write_deny_for_sid(p_dacl, psid),
-            Self::ReadAndControl => dacl_has_deny_mask(
+            Self::ReadAndControl | Self::WriteAndControl => dacl_has_deny_mask(
                 p_dacl,
                 DenyAceScope::EffectiveForSid(psid),
                 self.mask(),
@@ -1110,6 +1114,16 @@ pub unsafe fn add_owner_rights_read_control_ace(path: &Path) -> Result<()> {
 pub unsafe fn protect_read_denied_path(path: &Path, psid: *mut c_void) -> Result<bool> {
     add_owner_rights_read_control_ace(path)?;
     add_deny_ace(path, psid, DenyAceKind::ReadAndControl)
+}
+
+/// Protects a read-only path for a read-enforcing token: suppresses implicit
+/// owner rights, then denies `psid` writes and DACL and owner changes.
+///
+/// # Safety
+/// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
+pub unsafe fn protect_write_denied_path(path: &Path, psid: *mut c_void) -> Result<bool> {
+    add_owner_rights_read_control_ace(path)?;
+    add_deny_ace(path, psid, DenyAceKind::WriteAndControl)
 }
 
 #[cfg(test)]

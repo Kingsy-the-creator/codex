@@ -120,3 +120,75 @@ fn elevated_root_write_with_retained_denied_read_is_refused_before_setup() {
     )
     .expect("scoped write with a retained denied read is enforceable");
 }
+
+#[test]
+fn unelevated_root_write_with_retained_denied_read_uses_read_enforcing_route() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = AbsolutePathBuf::from_absolute_path(dir.path().join("work")).unwrap();
+    let private = dir.path().join("private");
+    std::fs::create_dir_all(cwd.as_path()).unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    let denied = FileSystemSandboxEntry::new(
+        AbsolutePathBuf::from_absolute_path(&private)
+            .unwrap()
+            .into(),
+        FileSystemAccessMode::Deny,
+    );
+    // Shape produced by `FileSystemSandboxPolicy::for_approved_command` for a
+    // baseline that carries a denied read: `:root` write plus the retained denial.
+    let approved = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Write,
+            ),
+            denied.clone(),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let overrides = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &approved,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect("root write with a retained denied read uses the read-enforcing token")
+    .expect("the denied read is passed to the backend");
+    let private_key = dunce::canonicalize(&private).unwrap();
+    assert!(
+        overrides.additional_deny_read_paths.iter().any(|path| {
+            dunce::canonicalize(path.as_path()).is_ok_and(|path| path == private_key)
+        }),
+        "{overrides:?}"
+    );
+    assert_eq!(overrides.read_roots_override, None);
+    assert_eq!(overrides.write_roots_override, None);
+
+    // A scoped write root would lose its confinement under that token.
+    let scoped = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+            denied,
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let err = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &scoped,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect_err("scoped write with a denied read still needs the elevated backend");
+    assert!(
+        err.contains("cannot enforce deny-read restrictions directly"),
+        "{err}"
+    );
+}
