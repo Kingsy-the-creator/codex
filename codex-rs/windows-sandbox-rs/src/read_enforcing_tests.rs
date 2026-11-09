@@ -152,7 +152,9 @@ fn scoped_write_with_denied_read_still_requires_elevated_backend() -> Result<()>
         anyhow::bail!("scoped write with a denied read must not run in the legacy backend");
     };
     ensure!(
-        err.to_string().contains("require the elevated Windows sandbox backend"),
+        // Either legacy refusal is correct: the restricted-read check or the
+        // deny-read check, whichever runs first.
+        err.to_string().contains("elevated Windows sandbox backend"),
         "unexpected error: {err:#}"
     );
     Ok(())

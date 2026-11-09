@@ -502,6 +502,60 @@ unsafe fn dacl_has_deny_mask(p_dacl: *mut ACL, scope: DenyAceScope, deny_mask: u
     false
 }
 
+/// True only when the effective (not inherit-only) deny ACEs for `psid`
+/// together deny every bit of `deny_mask`. Unlike [`dacl_has_deny_mask`], a
+/// deny ACE that shares only some bits (for example a control deny that
+/// overlaps a write deny on `WRITE_DAC`) does not count, so a combined deny is
+/// never skipped because a narrower one already exists.
+unsafe fn dacl_denies_all_of_mask(p_dacl: *mut ACL, psid: *mut c_void, deny_mask: u32) -> bool {
+    if p_dacl.is_null() {
+        return false;
+    }
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetAclInformation(
+            p_dacl as *const ACL,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let mut denied = 0u32;
+    for i in 0..info.AceCount {
+        let mut p_ace: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetAce(p_dacl as *const ACL, i, &mut p_ace) } == 0 {
+            continue;
+        }
+        let hdr = unsafe { &*(p_ace as *const ACE_HEADER) };
+        if hdr.AceType != ACCESS_DENIED_ACE_TYPE || (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let ace = unsafe { &*(p_ace as *const ACCESS_DENIED_ACE) };
+        if unsafe { EqualSid(std::ptr::addr_of!(ace.SidStart) as *mut c_void, psid) } == 0 {
+            continue;
+        }
+        let mut mapped = ace.Mask;
+        unsafe { MapGenericMask(&mut mapped, &mapping) };
+        denied |= mapped;
+    }
+    // Compare specific and standard rights only: generic bits may be stored
+    // mapped or unmapped, and are mapped on both sides here.
+    const GENERIC_BITS: u32 = 0xF000_0000;
+    let mut wanted = deny_mask;
+    unsafe { MapGenericMask(&mut wanted, &mapping) };
+    let wanted = wanted & !GENERIC_BITS;
+    (denied & !GENERIC_BITS & wanted) == wanted
+}
+
 // Grant DELETE on each inheriting descendant instead of FILE_DELETE_CHILD on
 // its parent. A parent delete-child grant would bypass a direct deny-write ACE
 // on protected children such as `.git` or an explicit read-only subpath.
@@ -876,11 +930,9 @@ impl DenyAceKind {
         match self {
             Self::Read => dacl_has_read_deny_for_sid(p_dacl, psid),
             Self::Write => dacl_has_write_deny_for_sid(p_dacl, psid),
-            Self::ReadAndControl | Self::WriteAndControl => dacl_has_deny_mask(
-                p_dacl,
-                DenyAceScope::EffectiveForSid(psid),
-                self.mask(),
-            ),
+            Self::ReadAndControl | Self::WriteAndControl => {
+                dacl_denies_all_of_mask(p_dacl, psid, self.mask())
+            }
         }
     }
 }

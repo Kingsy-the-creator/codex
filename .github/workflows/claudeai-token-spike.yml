@@ -46,6 +46,9 @@ jobs:
           git diff --stat
           git diff --stat | ForEach-Object { Write-Output "::notice title=rustfmt::$_" }
           git diff | Out-File -FilePath ../rustfmt.diff -Encoding utf8
+          Write-Output '----- RUSTFMT DIFF BEGIN -----'
+          git --no-pager diff
+          Write-Output '----- RUSTFMT DIFF END -----'
           git checkout -- .
       - name: Build Windows sandbox helper binaries (as upstream CI does)
         shell: pwsh
@@ -110,10 +113,12 @@ jobs:
           )
           $failed = 0
           foreach ($t in $tests) {
-            cargo test -p codex-windows-sandbox --lib "unified_exec::tests::$t" -- --exact
+            $out = cargo test -p codex-windows-sandbox --lib "unified_exec::tests::$t" -- --exact 2>&1
             $c = $LASTEXITCODE
+            $out | ForEach-Object { Write-Output $_ }
+            $why = ($out | Select-String -Pattern 'panicked at' -Context 0,1 | Select-Object -First 1 | ForEach-Object { ($_.Line + ' ' + ($_.Context.PostContext -join ' ')).Trim() })
             Write-Output "LEGACY_EXACT $t exit=$c"
-            Write-Output "::notice title=legacy::$t exit=$c"
+            Write-Output "::notice title=legacy::$t exit=$c $why"
             if ($c -ne 0) { $failed++ }
           }
           Write-Output "LEGACY_EXACT_FAILED=$failed"
@@ -152,3 +157,65 @@ jobs:
           path: rustfmt.diff
           if-no-files-found: ignore
           retention-days: 7
+  # Same eight legacy tests, one process each, on the unmodified base commit,
+  # so a per-process failure can be attributed to the base or to this branch.
+  base-legacy:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d18d77d3b10b268ed1925b8bb612249c414587ef
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Enable Git long paths and short Cargo/temp paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+          "TMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          cache-on-failure: true
+          key: base-d18d77d
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
+        shell: pwsh
+        run: |
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+      - name: Base legacy tests, one process each (reported)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $tests = @(
+            'legacy_capture_cancellation_terminates_descendants_without_timeout',
+            'legacy_capture_emits_output_and_preserves_descendant_after_normal_exit',
+            'legacy_non_tty_cmd_emits_output',
+            'legacy_non_tty_cmd_rejects_deny_read_overrides',
+            'legacy_non_tty_powershell_interrupt_terminates_process',
+            'legacy_tty_job_terminates_and_preserves_descendants',
+            'legacy_tty_powershell_emits_output_and_accepts_input',
+            'legacy_workspace_write_delete_is_limited_to_writable_roots'
+          )
+          $failed = 0
+          foreach ($t in $tests) {
+            $out = cargo test -p codex-windows-sandbox --lib "unified_exec::tests::$t" -- --exact 2>&1
+            $c = $LASTEXITCODE
+            $out | ForEach-Object { Write-Output $_ }
+            $why = ($out | Select-String -Pattern 'panicked at' -Context 0,1 | Select-Object -First 1 | ForEach-Object { ($_.Line + ' ' + ($_.Context.PostContext -join ' ')).Trim() })
+            Write-Output "::notice title=base-legacy::$t exit=$c $why"
+            if ($c -ne 0) { $failed++ }
+          }
+          Write-Output "::notice title=base-legacy::FAILED=$failed"
+          if ($failed -ne 0) { exit 1 }

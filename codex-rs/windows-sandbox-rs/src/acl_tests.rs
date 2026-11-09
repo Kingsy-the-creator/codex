@@ -195,3 +195,47 @@ fn noninheriting_read_attributes_preserve_unprotected_child_dacl() {
     });
     assert_eq!(acl_snapshot(&child), before);
 }
+
+#[test]
+fn combined_deny_aces_are_not_skipped_for_partly_overlapping_denies() {
+    // A control deny shares WRITE_DAC, WRITE_OWNER and DELETE with a write deny.
+    // Each combined deny must still be added after the other, in either order.
+    for read_first in [true, false] {
+        let target = tempfile::TempDir::new().expect("temporary directory");
+        let sid = LocalSid::from_string("S-1-5-21-10-20-30-41").expect("test SID");
+        let path = target.path();
+        let psid = sid.as_ptr();
+        let (first, second) = if read_first {
+            (
+                super::DenyAceKind::ReadAndControl,
+                super::DenyAceKind::WriteAndControl,
+            )
+        } else {
+            (
+                super::DenyAceKind::WriteAndControl,
+                super::DenyAceKind::ReadAndControl,
+            )
+        };
+        assert!(unsafe { super::add_deny_ace(path, psid, first) }.expect("add first deny"));
+        assert!(
+            unsafe { super::add_deny_ace(path, psid, second) }.expect("add second deny"),
+            "second deny skipped (read_first={read_first})"
+        );
+        let handle = OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("open target");
+        for kind in [first, second] {
+            assert!(
+                unsafe { deny_ace_already_present(&handle, path, psid, kind) }
+                    .expect("read deny ACEs"),
+                "deny missing (read_first={read_first})"
+            );
+        }
+        assert!(
+            !unsafe { super::add_deny_ace(path, psid, second) }.expect("repeat second deny"),
+            "a present combined deny was added again (read_first={read_first})"
+        );
+    }
+}
