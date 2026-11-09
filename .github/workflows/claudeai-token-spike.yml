@@ -69,16 +69,16 @@ jobs:
           $out | ForEach-Object { Write-Output $_ }
           if ($code -ne 0) { exit $code }
           if (-not ($out -match 'test result: ok\. 1 passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
-      - name: Read-enforcing routing tests (both must run and pass)
+      - name: Read-enforcing module tests (all three must run and pass)
         if: always()
         shell: pwsh
         run: |
-          $out = cargo test -p codex-windows-sandbox --lib read_enforcing -- --nocapture 2>&1
+          $out = cargo test -p codex-windows-sandbox --lib read_enforcing::tests:: -- --nocapture 2>&1
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Output $_ }
-          $out | Select-String -Pattern '^test |panicked|^Error:|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=read_enforcing::$($_.Line)" }
+          $out | Select-String -Pattern '^test |panicked|^Error:|RESIDUAL|test result' | Select-Object -First 12 | ForEach-Object { Write-Output "::notice title=read_enforcing::$($_.Line)" }
           if ($code -ne 0) { exit $code }
-          if (-not ($out -match 'test result: ok\. 2 passed; 0 failed')) { Write-Output 'Expected exactly two read_enforcing tests.'; exit 1 }
+          if (-not ($out -match 'test result: ok\. 3 passed; 0 failed')) { Write-Output 'Expected exactly three read_enforcing module tests.'; exit 1 }
       - name: Sandboxing Windows resolver tests
         if: always()
         shell: pwsh
@@ -160,7 +160,8 @@ jobs:
   # Same eight legacy tests, one process each, on the unmodified base commit,
   # so a per-process failure can be attributed to the base or to this branch.
   base-legacy:
-    if: github.event.repository.fork == true
+    # Attribution is recorded (same four failures on the base); rerun on demand.
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.fork == true
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:

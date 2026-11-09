@@ -367,7 +367,10 @@ unsafe fn run_probe(
     let exit_err = GetLastError();
     CloseHandle(created.process_info.hThread);
     CloseHandle(created.process_info.hProcess);
-    ensure!(wait == 0, "probe child did not exit within 120 s (wait {wait})");
+    ensure!(
+        wait == 0,
+        "probe child did not exit within 120 s (wait {wait})"
+    );
     ensure!(got_exit, "GetExitCodeProcess failed: {exit_err}");
 
     let report = std::fs::read_to_string(fixture.out.join("r.txt")).unwrap_or_default();
@@ -439,20 +442,22 @@ fn read_enforcing_token_keeps_denied_reads_without_new_allow_aces() -> Result<()
             let (dacl, sd) = fetch_dacl_handle(&fixture.secret)?;
             let inherited_deny = dacl_has_read_deny_for_sid(dacl, capability.as_ptr());
             LocalFree(sd as HLOCAL);
-            assert!(inherited_deny, "secret file did not inherit the deny-read ACE");
+            assert!(
+                inherited_deny,
+                "secret file did not inherit the deny-read ACE"
+            );
         }
 
         let base = OwnedHandle::from_raw_handle(get_current_token_for_restriction()? as _);
         let base_raw = base.as_raw_handle() as HANDLE;
         // (d) Negative control: today's WRITE_RESTRICTED constructor with the
         // same capability and user SIDs.
-        let control = OwnedHandle::from_raw_handle(
-            create_workspace_write_token_with_caps_and_user_from(
+        let control =
+            OwnedHandle::from_raw_handle(create_workspace_write_token_with_caps_and_user_from(
                 base_raw,
                 &[capability.as_ptr()],
                 &[],
-            )? as _,
-        );
+            )? as _);
         let variant = OwnedHandle::from_raw_handle(
             create_read_enforcing_token_with_caps_and_user_from(base_raw, &[capability.as_ptr()])?
                 as _,
@@ -464,7 +469,8 @@ fn read_enforcing_token_keeps_denied_reads_without_new_allow_aces() -> Result<()
             file_access_allowed(&control_fixture.secret, control_raw, FILE_READ_DATA)?;
         let variant_secret_read =
             file_access_allowed(&variant_fixture.secret, variant_raw, FILE_READ_DATA)?;
-        let variant_secret_dac = file_access_allowed(&variant_fixture.secret, variant_raw, WRITE_DAC)?;
+        let variant_secret_dac =
+            file_access_allowed(&variant_fixture.secret, variant_raw, WRITE_DAC)?;
         let variant_dir_dac =
             file_access_allowed(&variant_fixture.secret_dir, variant_raw, WRITE_DAC)?;
         let variant_sibling_read =
@@ -486,9 +492,16 @@ fn read_enforcing_token_keeps_denied_reads_without_new_allow_aces() -> Result<()
         let (codes, exit) = variant_run?;
 
         // (d) The control child reads the secret: WRITE_RESTRICTED ignores the deny.
-        assert!(control_secret_read, "control AccessCheck should allow the read");
+        assert!(
+            control_secret_read,
+            "control AccessCheck should allow the read"
+        );
         assert_eq!(control_exit, 0, "control child failed to run");
-        assert_eq!(probe_code(&control_codes, "secret"), 0, "control should read the secret");
+        assert_eq!(
+            probe_code(&control_codes, "secret"),
+            0,
+            "control should read the secret"
+        );
         assert_eq!(
             read_trimmed(&control_fixture.out.join("secret_copy.txt")),
             SECRET_TEXT
@@ -501,8 +514,15 @@ fn read_enforcing_token_keeps_denied_reads_without_new_allow_aces() -> Result<()
         );
         assert_eq!(exit, 0, "variant child exit code");
         // (b)/(h) The read fails with access denied, not file-not-found.
-        assert!(!variant_secret_read, "variant AccessCheck allowed the denied read");
-        assert_ne!(probe_code(&codes, "secret"), 0, "variant child read the denied secret");
+        assert!(
+            !variant_secret_read,
+            "variant AccessCheck allowed the denied read"
+        );
+        assert_ne!(
+            probe_code(&codes, "secret"),
+            0,
+            "variant child read the denied secret"
+        );
         let secret_err = read_trimmed(&variant_fixture.out.join("secret_err.txt"));
         assert!(
             secret_err.to_ascii_lowercase().contains("access is denied"),
@@ -528,14 +548,21 @@ fn read_enforcing_token_keeps_denied_reads_without_new_allow_aces() -> Result<()
             "secret readable after strip attempts"
         );
         // (e) Path-scoped: the sibling stays readable.
-        assert!(variant_sibling_read, "variant AccessCheck denied the sibling");
+        assert!(
+            variant_sibling_read,
+            "variant AccessCheck denied the sibling"
+        );
         assert_eq!(probe_code(&codes, "sibling"), 0, "sibling read failed");
         assert_eq!(
             read_trimmed(&variant_fixture.out.join("sibling_copy.txt")),
             SIBLING_TEXT
         );
         // (c) System files.
-        assert_eq!(probe_code(&codes, "kernel32"), 0, "kernel32.dll read failed");
+        assert_eq!(
+            probe_code(&codes, "kernel32"),
+            0,
+            "kernel32.dll read failed"
+        );
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         assert_eq!(
             std::fs::metadata(variant_fixture.out.join("k32.bin"))?.len(),
@@ -552,7 +579,10 @@ fn read_enforcing_token_keeps_denied_reads_without_new_allow_aces() -> Result<()
             0,
             "write outside denied paths failed"
         );
-        assert_eq!(read_trimmed(&variant_fixture.elsewhere.join("new.txt")), "hello");
+        assert_eq!(
+            read_trimmed(&variant_fixture.elsewhere.join("new.txt")),
+            "hello"
+        );
     }
     Ok(())
 }

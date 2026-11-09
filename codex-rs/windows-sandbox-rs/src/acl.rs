@@ -912,7 +912,10 @@ impl DenyAceKind {
         match self {
             Self::Read => FILE_GENERIC_READ | GENERIC_READ_MASK,
             Self::ReadAndControl => FILE_GENERIC_READ | GENERIC_READ_MASK | DENY_CONTROL_MASK,
-            Self::WriteAndControl => Self::Write.mask() | WRITE_DAC | WRITE_OWNER,
+            // Specific mutation rights only. `FILE_GENERIC_WRITE` and the
+            // generic-write bit also carry `READ_CONTROL` and `SYNCHRONIZE`,
+            // which a token without `WRITE_RESTRICTED` needs for ordinary reads.
+            Self::WriteAndControl => STANDARD_USER_MUTATION_MASK,
             Self::Write => {
                 FILE_GENERIC_WRITE
                     | FILE_WRITE_DATA
