@@ -257,7 +257,12 @@ fn verify_protected_paths(
         verify_tree(&impersonation, denied, DENIED_FORBIDDEN_RIGHTS, "denied")?;
     }
     for path in read_only_paths {
-        verify_tree(&impersonation, path, READ_ONLY_FORBIDDEN_RIGHTS, "read-only")?;
+        verify_tree(
+            &impersonation,
+            path,
+            READ_ONLY_FORBIDDEN_RIGHTS,
+            "read-only",
+        )?;
     }
     Ok(())
 }
@@ -392,7 +397,7 @@ unsafe fn granted_file_access(path: &Path, impersonation: HANDLE, desired: u32) 
 /// for `desired`; zero when it grants nothing.
 ///
 /// # Safety
-/// `sd` must be a valid self-relative security descriptor with owner, group
+/// `sd` must be a valid security descriptor with owner, group
 /// and DACL, and `impersonation` a valid impersonation token handle.
 unsafe fn access_check_descriptor(
     sd: *mut c_void,

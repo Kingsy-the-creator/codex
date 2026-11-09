@@ -176,22 +176,39 @@ fn scoped_write_with_denied_read_still_requires_elevated_backend() -> Result<()>
 }
 
 /// Records, without asserting, whether a token can open an unrestricted
-/// same-user process (this test process) with the rights needed to run code in
-/// it. Process isolation is a documented residual of the read-enforcing token;
-/// today's `WRITE_RESTRICTED` token is the comparison.
+/// same-user process with the rights needed to run code in it. Process
+/// isolation is a documented residual of the read-enforcing token; today's
+/// `WRITE_RESTRICTED` token is the comparison.
+///
+/// Two descriptors are checked: this test process as it runs, and a modelled
+/// standard-user process (the default DACL of a non-elevated interactive
+/// token: user and SYSTEM full access, logon SID read and execute). CI runs
+/// elevated, where this process's DACL names Administrators rather than the
+/// user, so the modelled descriptor is the case that matters on a normal PC.
 #[test]
 fn same_user_process_access_is_measured() -> Result<()> {
     use crate::token::create_workspace_write_token_with_caps_from;
+    use crate::token::get_user_sid_bytes;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::io::FromRawHandle;
     use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::ACL_REVISION;
+    use windows_sys::Win32::Security::AddAccessAllowedAce;
     use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+    use windows_sys::Win32::Security::InitializeAcl;
+    use windows_sys::Win32::Security::InitializeSecurityDescriptor;
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+    use windows_sys::Win32::Security::SetSecurityDescriptorDacl;
+    use windows_sys::Win32::Security::SetSecurityDescriptorGroup;
+    use windows_sys::Win32::Security::SetSecurityDescriptorOwner;
     use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::Threading::PROCESS_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::PROCESS_CREATE_THREAD;
     use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
     use windows_sys::Win32::System::Threading::PROCESS_VM_OPERATION;
     use windows_sys::Win32::System::Threading::PROCESS_VM_READ;
     use windows_sys::Win32::System::Threading::PROCESS_VM_WRITE;
@@ -205,6 +222,7 @@ fn same_user_process_access_is_measured() -> Result<()> {
         GenericAll: PROCESS_ALL_ACCESS,
     };
     let capability = LocalSid::from_string("S-1-5-21-10-20-30-42")?;
+    let system = LocalSid::from_string("S-1-5-18")?;
     unsafe {
         let base = OwnedHandle::from_raw_handle(get_current_token_for_restriction()? as _);
         let base_raw = base.as_raw_handle() as HANDLE;
@@ -212,11 +230,21 @@ fn same_user_process_access_is_measured() -> Result<()> {
             create_read_enforcing_token_with_caps_and_user_from(base_raw, &[capability.as_ptr()])?
                 as _,
         );
-        let control = OwnedHandle::from_raw_handle(
-            create_workspace_write_token_with_caps_from(base_raw, &[capability.as_ptr()])? as _,
-        );
+        let control = OwnedHandle::from_raw_handle(create_workspace_write_token_with_caps_from(
+            base_raw,
+            &[capability.as_ptr()],
+        )? as _);
         let variant_imp = ImpersonationToken::duplicate(variant.as_raw_handle() as HANDLE)?;
         let control_imp = ImpersonationToken::duplicate(control.as_raw_handle() as HANDLE)?;
+        let measure = |sd: *mut c_void| -> Result<(u32, u32)> {
+            Ok((
+                access_check_descriptor(sd, variant_imp.0, INJECTION_RIGHTS, &mapping)?
+                    & INJECTION_RIGHTS,
+                access_check_descriptor(sd, control_imp.0, INJECTION_RIGHTS, &mapping)?
+                    & INJECTION_RIGHTS,
+            ))
+        };
+
         let mut sd: *mut c_void = std::ptr::null_mut();
         let code = GetSecurityInfo(
             GetCurrentProcess(),
@@ -232,14 +260,39 @@ fn same_user_process_access_is_measured() -> Result<()> {
             code == ERROR_SUCCESS,
             "GetSecurityInfo(process) failed: {code}"
         );
-        let read_enforcing = access_check_descriptor(sd, variant_imp.0, INJECTION_RIGHTS, &mapping);
-        let write_restricted =
-            access_check_descriptor(sd, control_imp.0, INJECTION_RIGHTS, &mapping);
+        let this_process = measure(sd);
         LocalFree(sd as HLOCAL);
-        let read_enforcing = read_enforcing? & INJECTION_RIGHTS;
-        let write_restricted = write_restricted? & INJECTION_RIGHTS;
+        let (variant_here, control_here) = this_process?;
+
+        let mut user = get_user_sid_bytes(base_raw)?;
+        let mut logon = get_logon_sid_bytes(base_raw)?;
+        let mut acl_buffer = [0u32; 256];
+        let acl = acl_buffer.as_mut_ptr().cast::<ACL>();
+        let acl_bytes = std::mem::size_of_val(&acl_buffer) as u32;
+        ensure!(InitializeAcl(acl, acl_bytes, ACL_REVISION) != 0);
+        for (mask, sid) in [
+            (PROCESS_ALL_ACCESS, user.as_mut_ptr().cast::<c_void>()),
+            (PROCESS_ALL_ACCESS, system.as_ptr()),
+            (
+                READ_CONTROL | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                logon.as_mut_ptr().cast::<c_void>(),
+            ),
+        ] {
+            ensure!(AddAccessAllowedAce(acl, ACL_REVISION, mask, sid) != 0);
+        }
+        let mut descriptor: SECURITY_DESCRIPTOR = std::mem::zeroed();
+        let modelled = std::ptr::addr_of_mut!(descriptor).cast::<c_void>();
+        ensure!(InitializeSecurityDescriptor(modelled, 1) != 0);
+        ensure!(SetSecurityDescriptorOwner(modelled, user.as_mut_ptr().cast(), 0) != 0);
+        ensure!(SetSecurityDescriptorGroup(modelled, user.as_mut_ptr().cast(), 0) != 0);
+        ensure!(SetSecurityDescriptorDacl(modelled, 1, acl, 0) != 0);
+        let (variant_user, control_user) = measure(modelled)?;
+
         println!(
-            "RESIDUAL same-user process injection rights granted: read-enforcing={read_enforcing:#x} write-restricted={write_restricted:#x} (wanted {INJECTION_RIGHTS:#x})"
+            "RESIDUAL injection rights on this process: read-enforcing={variant_here:#x} write-restricted={control_here:#x} (wanted {INJECTION_RIGHTS:#x})"
+        );
+        println!(
+            "RESIDUAL injection rights on a modelled standard-user process: read-enforcing={variant_user:#x} write-restricted={control_user:#x} (wanted {INJECTION_RIGHTS:#x})"
         );
     }
     Ok(())
