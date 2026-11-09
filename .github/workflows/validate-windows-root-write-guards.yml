@@ -37,6 +37,13 @@ jobs:
         run: cargo fmt --check -p codex-windows-sandbox -p codex-sandboxing
       - name: Require four named tests, run them, then both unit suites
         run: python ../.github/scripts/validate-root-write-guard-tests.py
+      # Upstream CI runs cargo without --locked at this commit; cargo 1.95 asks to
+      # update Cargo.lock here. Show exactly what it changed instead of hiding it.
+      - name: Report any Cargo.lock change cargo made
+        if: always()
+        run: |
+          git diff --stat -- Cargo.lock
+          git diff -- Cargo.lock | Select-Object -First 80
       - name: Clippy (separately reported; does not establish unit test success)
         continue-on-error: true
-        run: cargo clippy --locked -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings
+        run: cargo clippy -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings

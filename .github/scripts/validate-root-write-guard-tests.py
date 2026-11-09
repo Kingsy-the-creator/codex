@@ -24,7 +24,7 @@ def main():
     if sys.platform != "win32":
         raise SystemExit("These tests are Windows-gated; a Linux run cannot validate them.")
     for crate, expected in EXPECTED.items():
-        prefix = ["cargo", "test", "--locked", "-p", crate, "--lib"]
+        prefix = ["cargo", "test", "-p", crate, "--lib"]
         listing = run(prefix + ["--", "--list"])
         discovered = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
         for name in expected:
@@ -32,7 +32,7 @@ def main():
             if len(matches) != 1:
                 raise SystemExit(f"Expected exactly one {name}; discovered {len(matches)}. Refusing a zero-test pass.")
             run(prefix + [matches[0], "--", "--exact", "--nocapture"])
-    run(["cargo", "test", "--locked", "-p", "codex-sandboxing", "-p", "codex-windows-sandbox", "--lib"])
+    run(["cargo", "test", "-p", "codex-sandboxing", "-p", "codex-windows-sandbox", "--lib"])
 
 if __name__ == "__main__":
     main()
