@@ -254,6 +254,18 @@ pub fn resolve_windows_elevated_filesystem_overrides(
 
     let split_writable_roots =
         file_system_sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
+    // The elevated backend grants write access by adding ACEs to each writable
+    // root from the unelevated setup refresh. Granting an ACE on the system
+    // drive root failed with access denied in the reported setup refresh. A
+    // root-write policy with carveouts can reach that path even though it is
+    // not classified as full-disk write access. Refuse root-write policies
+    // here, before any helper is spawned, with an actionable message.
+    if let Some(root) = filesystem_root_write_root(&split_writable_roots) {
+        return Err(format!(
+            "windows elevated sandbox will not grant write access to filesystem root {}; request scoped filesystem permissions for the directories the command needs instead of escalating",
+            root.display()
+        ));
+    }
     if has_reopened_writable_descendant(&split_writable_roots) {
         return Err(
             "windows elevated sandbox cannot reopen writable descendants under read-only carveouts directly; refusing to run unsandboxed"
@@ -392,6 +404,16 @@ fn permission_profile_display_name(permission_profile: &PermissionProfile) -> &'
         PermissionProfile::Disabled => "Disabled",
         PermissionProfile::External { .. } => "External",
     }
+}
+
+/// Returns the first writable root that is a filesystem root (a drive root such
+/// as `C:\`, a UNC share root, or `/`). The elevated setup refresh refuses
+/// to grant write ACEs to filesystem roots.
+fn filesystem_root_write_root(writable_roots: &[WritableRoot]) -> Option<&Path> {
+    writable_roots
+        .iter()
+        .map(|writable_root| writable_root.root.as_path())
+        .find(|root| root.parent().is_none())
 }
 
 fn has_reopened_writable_descendant(writable_roots: &[WritableRoot]) -> bool {
