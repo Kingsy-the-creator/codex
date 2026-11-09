@@ -33,17 +33,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
+          cache-on-failure: true
       - name: Format check
         run: cargo fmt --check -p codex-windows-sandbox -p codex-sandboxing
       - name: Require four named tests, run them, then both unit suites
         run: python ../.github/scripts/validate-root-write-guard-tests.py
+      - name: Full Windows sandbox suite, independently of sandboxing suite failure
+        if: always()
+        run: cargo test -p codex-windows-sandbox --lib
       # Upstream CI runs cargo without --locked at this commit; cargo 1.95 asks to
       # update Cargo.lock here. Show exactly what it changed instead of hiding it.
       - name: Report any Cargo.lock change cargo made
         if: always()
         run: |
           git diff --stat -- Cargo.lock
-          git diff -- Cargo.lock | Select-Object -First 80
+          git diff -- Cargo.lock | Out-File -FilePath ../windows-ci-cargo-lock.diff -Encoding utf8
       - name: Clippy (separately reported; does not establish unit test success)
         continue-on-error: true
         run: cargo clippy -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings
+      - name: Compare the failing helper test with unpatched base in this runner
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          git -C .. fetch --depth=1 origin c40729ea5cf8e947481b130c59807273eda2f8e9
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C .. restore --source=c40729ea5cf8e947481b130c59807273eda2f8e9 -- codex-rs/sandboxing/src/windows.rs codex-rs/sandboxing/src/windows_tests.rs codex-rs/windows-sandbox-rs/src/setup.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p codex-sandboxing --lib manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture
+      - name: Preserve complete resolved lockfile and its diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-guard-validation-lockfile
+          path: |
+            codex-rs/Cargo.lock
+            windows-ci-cargo-lock.diff
+          retention-days: 7
