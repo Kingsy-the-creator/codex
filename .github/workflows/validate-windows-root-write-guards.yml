@@ -1,0 +1,34 @@
+# Proposed validation only. Neither guard restores broad escalation.
+name: validate windows root-write guards
+on:
+  workflow_dispatch:
+  push:
+    branches: [root-write-guards]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  windows:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+      - name: Format check
+        run: cargo fmt --check -p codex-windows-sandbox -p codex-sandboxing
+      - name: Require four named tests, run them, then both unit suites
+        run: python ../.github/scripts/validate-root-write-guard-tests.py
+      - name: Clippy (separately reported; does not establish unit test success)
+        continue-on-error: true
+        run: cargo clippy --locked -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings
