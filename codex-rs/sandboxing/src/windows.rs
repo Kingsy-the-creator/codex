@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::WritableRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -396,7 +399,13 @@ fn read_enforcing_filesystem_overrides(
     additional_deny_read_paths: Vec<AbsolutePathBuf>,
 ) -> std::result::Result<Option<WindowsSandboxFilesystemOverrides>, String> {
     let writable_roots = file_system_sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
-    if filesystem_root_write_root(&writable_roots).is_none() {
+    // Only the symbolic `:root` write grant covers every volume and share. A
+    // write grant on one drive root would leave the rest only readable, which
+    // this token cannot confine.
+    if !has_symbolic_special_entry(file_system_sandbox_policy, |special, access| {
+        matches!(special, FileSystemSpecialPath::Root) && access.can_write()
+    }) || filesystem_root_write_root(&writable_roots).is_none()
+    {
         return Err(
             "windows unelevated restricted-token sandbox cannot enforce deny-read restrictions directly; refusing to run unsandboxed"
                 .to_string(),
@@ -405,6 +414,20 @@ fn read_enforcing_filesystem_overrides(
     if has_reopened_writable_descendant(&writable_roots) {
         return Err(
             "windows unelevated restricted-token sandbox cannot reopen writable descendants under read-only carveouts directly; refusing to run unsandboxed"
+                .to_string(),
+        );
+    }
+    // Temporary-directory denies resolve from this process's environment here,
+    // not the command's TEMP/TMP, so they could leave the command's temporary
+    // folders readable. Refuse rather than guess.
+    if has_symbolic_special_entry(file_system_sandbox_policy, |special, access| {
+        matches!(
+            special,
+            FileSystemSpecialPath::Tmpdir | FileSystemSpecialPath::SlashTmp
+        ) && !access.can_read()
+    }) {
+        return Err(
+            "windows unelevated restricted-token sandbox cannot enforce temporary-directory deny-read restrictions directly; refusing to run unsandboxed"
                 .to_string(),
         );
     }
@@ -458,6 +481,19 @@ fn filesystem_root_write_root(writable_roots: &[WritableRoot]) -> Option<&Path> 
         .iter()
         .map(|writable_root| writable_root.root.as_path())
         .find(|root| root.parent().is_none())
+}
+
+fn has_symbolic_special_entry(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    matches_entry: impl Fn(&FileSystemSpecialPath, FileSystemAccessMode) -> bool,
+) -> bool {
+    file_system_sandbox_policy
+        .entries
+        .iter()
+        .any(|entry| match &entry.path {
+            FileSystemPath::Special { value } => matches_entry(value, entry.access),
+            _ => false,
+        })
 }
 
 fn has_reopened_writable_descendant(writable_roots: &[WritableRoot]) -> bool {

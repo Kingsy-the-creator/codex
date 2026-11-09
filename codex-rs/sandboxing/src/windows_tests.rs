@@ -191,4 +191,75 @@ fn unelevated_root_write_with_retained_denied_read_uses_read_enforcing_route() {
         err.contains("cannot enforce deny-read restrictions directly"),
         "{err}"
     );
+
+    // A write grant on one drive root is not `:root` write: other volumes and
+    // shares stay read-only, which the read-enforcing token cannot confine.
+    let drive_root = cwd.as_path().ancestors().last().unwrap().to_path_buf();
+    let drive_write = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(&drive_root)
+                    .unwrap()
+                    .into(),
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(&private)
+                    .unwrap()
+                    .into(),
+                FileSystemAccessMode::Deny,
+            ),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let err = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &drive_write,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect_err("a drive-root write grant must not use the read-enforcing token");
+    assert!(
+        err.contains("cannot enforce deny-read restrictions directly"),
+        "{err}"
+    );
+
+    // A temporary-directory deny resolves from this process, not the command.
+    let tmpdir_deny = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                FileSystemAccessMode::Deny,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(&private)
+                    .unwrap()
+                    .into(),
+                FileSystemAccessMode::Deny,
+            ),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let err = resolve_windows_restricted_token_filesystem_overrides(
+        SandboxType::WindowsRestrictedToken,
+        &tmpdir_deny,
+        &cwd,
+        WindowsSandboxLevel::RestrictedToken,
+    )
+    .expect_err("a temporary-directory deny must not use the read-enforcing token");
+    assert!(err.contains("refusing to run unsandboxed"), "{err}");
 }

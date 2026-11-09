@@ -22,7 +22,10 @@
 //!
 //! Each protection set (root, denied-read paths, read-only paths) has its own
 //! capability SID, so concurrent sessions never revoke each other's denies and
-//! a deny left by an earlier set never applies to a later token.
+//! a deny left by an earlier set never applies to a later token. ACL
+//! preparation runs under a cross-process mutex, so overlapping launches of
+//! this route never lose each other's ACEs. ACL writers in other backends do
+//! not take it; that race is unchanged from before this route.
 //!
 //! Residuals:
 //! - The user's rights on a protected path's parent still let the command
@@ -44,6 +47,7 @@ use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
 use crate::cap::read_enforcing_cap_sid_for_set;
 use crate::deny_read_acl::DenyReadAceStyle;
+use crate::deny_read_acl::lexical_path_key;
 use crate::deny_read_state::sync_persistent_deny_read_acls_with_style;
 use crate::path_normalization::canonical_path_key;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -69,6 +73,8 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::WAIT_ABANDONED;
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Security::AccessCheck;
 use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
@@ -90,11 +96,24 @@ use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
 use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
+use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::ReleaseMutex;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 /// Upper bound on entries checked under each protected path. A larger tree is
 /// refused rather than partly checked. Each entry costs one security-descriptor
 /// read and one `AccessCheck`.
 const MAX_VERIFIED_ENTRIES_PER_PATH: usize = 100_000;
+
+/// Serialises read-enforcing ACL preparation across processes in this logon
+/// session, so overlapping launches never lose each other's ACEs to a
+/// read-modify-write race.
+const ACL_UPDATE_MUTEX_NAME: &str = "Local\\codex-windows-sandbox-read-enforcing-acl";
+
+/// How long a launch waits for another launch's ACL preparation. The run is
+/// refused on timeout, so a process holding the mutex can delay but never
+/// weaken a launch.
+const ACL_UPDATE_TIMEOUT_MS: u32 = 120_000;
 
 /// Returns the filesystem-root write grant (for example `C:\`) in the
 /// resolved allow set, if any.
@@ -110,9 +129,10 @@ pub(crate) fn filesystem_root_allow_path(
 }
 
 /// True when this legacy run should use the read-enforcing token: deny-read
-/// paths exist, the root stays readable, and writes are already granted from
-/// the filesystem root. Scoped write policies would lose their write
-/// confinement under this token, so they never qualify.
+/// paths exist, the root stays readable, and the symbolic `:root` entry
+/// already grants write. Scoped write policies, including a write grant on
+/// one drive root, would lose their write confinement under this token, so
+/// they never qualify.
 pub(crate) fn uses_read_enforcing_session(
     permissions: &ResolvedWindowsSandboxPermissions,
     current_dir: &Path,
@@ -121,6 +141,7 @@ pub(crate) fn uses_read_enforcing_session(
 ) -> bool {
     !deny_read_paths.is_empty()
         && permissions.has_symbolic_root_read_access(current_dir)
+        && permissions.has_symbolic_root_write_access()
         && filesystem_root_allow_path(permissions, current_dir, env_map).is_some()
 }
 
@@ -134,8 +155,14 @@ pub(crate) fn prepare_read_enforcing_session_security(
     deny_read_paths: &[PathBuf],
     additional_deny_write_paths: &[PathBuf],
 ) -> Result<LegacySessionSecurity> {
+    ensure!(
+        permissions.has_symbolic_root_write_access(),
+        "read-enforcing session requires a symbolic `:root` write grant"
+    );
     let root = filesystem_root_allow_path(permissions, current_dir, env_map)
         .context("read-enforcing session requires a filesystem-root write grant")?;
+    // Held until the token is verified; dropped on every return path.
+    let _acl_lock = AclUpdateLock::acquire()?;
 
     let AllowDenyPaths { deny, .. } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
@@ -207,7 +234,10 @@ pub(crate) fn prepare_read_enforcing_session_security(
 }
 
 /// Stable key for one protection set: the root, then the sorted denied-read
-/// and read-only path keys.
+/// and read-only path keys. Each path contributes its lexical and canonical
+/// keys, because deny-read reconciliation tracks lexical paths: a junction
+/// alias and its target must not share a SID, or reconciling one would
+/// revoke the other's deny from the same file.
 fn protection_set_key(
     root: &Path,
     deny_read_paths: &[PathBuf],
@@ -224,7 +254,7 @@ fn protection_set_key(
 fn sorted_path_keys<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> String {
     let keys: BTreeSet<String> = paths
         .into_iter()
-        .map(|path| canonical_path_key(path))
+        .map(|path| format!("{}>{}", lexical_path_key(path), canonical_path_key(path)))
         .collect();
     keys.into_iter().collect::<Vec<_>>().join("|")
 }
@@ -317,6 +347,41 @@ fn entries_under(path: &Path) -> Result<Vec<PathBuf>> {
         entries.push(next);
     }
     Ok(entries)
+}
+
+/// Cross-process lock over read-enforcing ACL preparation.
+struct AclUpdateLock(HANDLE);
+
+impl AclUpdateLock {
+    fn acquire() -> Result<Self> {
+        let name = to_wide(ACL_UPDATE_MUTEX_NAME);
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!("CreateMutexW failed: {err}"));
+        }
+        let wait = unsafe { WaitForSingleObject(handle, ACL_UPDATE_TIMEOUT_MS) };
+        // An abandoned mutex is still owned; each launch re-applies and
+        // re-verifies its own ACEs, so a crashed holder leaves nothing to trust.
+        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(anyhow!(
+                "timed out waiting for another sandbox launch to finish ACL preparation (wait {wait}); refusing to run"
+            ));
+        }
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for AclUpdateLock {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
 }
 
 /// An impersonation copy of a token, as `AccessCheck` requires.

@@ -130,6 +130,15 @@ impl ResolvedWindowsSandboxPermissions {
             .is_some_and(|root| self.file_system.can_read_local_path_with_cwd(root, cwd))
     }
 
+    /// True when the policy grants write through the symbolic `:root` entry,
+    /// which covers every volume and share, not only one drive root.
+    pub(crate) fn has_symbolic_root_write_access(&self) -> bool {
+        self.file_system.entries.iter().any(|entry| {
+            matches!(&entry.path, FileSystemPath::Special { value: Root })
+                && entry.access.can_write()
+        })
+    }
+
     pub(crate) fn include_platform_defaults(&self) -> bool {
         self.file_system.include_platform_defaults()
     }
