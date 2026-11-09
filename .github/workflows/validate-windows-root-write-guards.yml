@@ -59,6 +59,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
           Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
           Get-Item "$dbg\deps\codex-windows-sandbox-setup.exe", "$dbg\deps\codex-command-runner.exe" | Select-Object FullName, Length
+      - name: Isolated legacy cancellation test on the patched candidate
+        continue-on-error: true
+        run: cargo test -p codex-windows-sandbox --lib unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout -- --exact --nocapture
       - name: Require four named tests, run them, then both unit suites
         run: python ../.github/scripts/validate-root-write-guard-tests.py
       - name: Full Windows sandbox suite, independently of sandboxing suite failure
@@ -74,7 +77,7 @@ jobs:
       - name: Clippy (separately reported; does not establish unit test success)
         continue-on-error: true
         run: cargo clippy -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings
-      - name: Compare the failing helper test with unpatched base in this runner
+      - name: Compare isolated cancellation and the full Windows suite with unpatched base
         if: always()
         continue-on-error: true
         shell: pwsh
@@ -83,7 +86,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git -C .. restore --source=c40729ea5cf8e947481b130c59807273eda2f8e9 -- codex-rs/sandboxing/src/windows.rs codex-rs/sandboxing/src/windows_tests.rs codex-rs/windows-sandbox-rs/src/setup.rs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p codex-sandboxing --lib manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture
+          # Rebuild and re-copy helpers from the restored source as well.
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+          cargo test -p codex-windows-sandbox --lib unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout -- --exact --nocapture
+          $cancelExit = $LASTEXITCODE
+          cargo test -p codex-windows-sandbox --lib
+          $suiteExit = $LASTEXITCODE
+          Write-Output "UNPATCHED_BASE_CANCELLATION_EXIT=$cancelExit UNPATCHED_BASE_WINDOWS_SUITE_EXIT=$suiteExit"
+          if ($cancelExit -ne 0 -or $suiteExit -ne 0) { exit 1 }
       - name: Preserve complete resolved lockfile and its diff
         if: always()
         uses: actions/upload-artifact@v4
