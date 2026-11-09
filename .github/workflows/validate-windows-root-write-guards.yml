@@ -22,6 +22,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
+      # Mirrors upstream .github/actions/setup-ci: cargo's git checkout of the
+      # rusty_v8 submodule tree exceeds MAX_PATH without core.longpaths, and a
+      # short CARGO_HOME keeps every checkout path well under the limit.
+      - name: Enable Git long paths and short Cargo paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
