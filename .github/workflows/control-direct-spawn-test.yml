@@ -1,0 +1,43 @@
+# Control run: executes ONE pre-existing upstream test on the UNPATCHED base
+# commit c40729ea in the same hosted-runner environment as the
+# root-write-guards workflow. Purpose: show whether
+# manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper
+# fails on windows-latest without any guard patches applied.
+name: control direct-spawn test at base
+on:
+  workflow_dispatch:
+  push:
+    branches: [control-base-c40729ea]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  windows:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Enable Git long paths and short Cargo paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+      - name: Confirm no guard code is present at this commit
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          if (Select-String -Path sandboxing/src/windows.rs -Pattern 'filesystem_root_write_root' -Quiet) { throw 'guard present' }
+          if (Select-String -Path windows-sandbox-rs/src/setup.rs -Pattern 'validate_refresh_write_roots' -Quiet) { throw 'guard present' }
+          Write-Host 'unpatched base confirmed'
+      - name: Run the one pre-existing test on the unpatched base
+        run: cargo test -p codex-sandboxing --lib transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture
