@@ -332,6 +332,15 @@ fn setup_refresh_deny_read_paths(
         .map_err(|err| anyhow!(err))
 }
 
+fn validate_refresh_write_roots(write_roots: &[PathBuf]) -> Result<()> {
+    if write_roots.iter().any(|root| root.parent().is_none()) {
+        anyhow::bail!(
+            "elevated Windows sandbox will not grant write access to a filesystem root; request scoped filesystem permissions instead"
+        );
+    }
+    Ok(())
+}
+
 fn run_setup_refresh_inner(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
@@ -342,6 +351,9 @@ fn run_setup_refresh_inner(
         .permissions
         .validate_elevated_filesystem_policy(request.command_cwd)?;
     let (read_roots, write_roots) = build_payload_roots(&request, &overrides, runtime);
+    // Validate the roots that would actually receive capability ACEs, after
+    // explicit overrides. A profile-level check also rejects read-only refreshes.
+    validate_refresh_write_roots(&write_roots)?;
     let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
@@ -1619,6 +1631,100 @@ mod tests {
             workspace_roots,
         )
         .expect("managed permission profile")
+    }
+
+    #[test]
+    fn refresh_write_root_validation_allows_empty_and_scoped_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        super::validate_refresh_write_roots(&[]).expect("no write ACEs requested");
+        super::validate_refresh_write_roots(&[workspace]).expect("scoped write ACE allowed");
+        let root = tmp.path().ancestors().last().expect("filesystem root");
+        let err = super::validate_refresh_write_roots(&[root.to_path_buf()])
+            .expect_err("filesystem-root write ACE refused");
+        assert!(err.to_string().contains("will not grant write access"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refresh_write_root_validation_rejects_drive_and_unc_roots() {
+        for root in [r"C:\", r"D:\", r"\\server\share\"] {
+            super::validate_refresh_write_roots(&[PathBuf::from(root)])
+                .expect_err("drive or UNC-share root write ACE refused");
+        }
+    }
+
+    #[test]
+    fn refresh_write_root_validation_uses_computed_roots_with_retained_denial() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let private = tmp.path().join("private");
+        let codex_home = tmp.path().join("codex-home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&private).expect("create denied fixture");
+        let profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        FileSystemAccessMode::Write,
+                    ),
+                    FileSystemSandboxEntry::new(
+                        AbsolutePathBuf::from_absolute_path(&private)
+                            .expect("absolute denied fixture")
+                            .into(),
+                        FileSystemAccessMode::Deny,
+                    ),
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+        let permissions = permissions_for(&profile, &workspace_roots_for(&workspace));
+        let env_map = HashMap::new();
+        let request = super::SandboxSetupRequest {
+            permissions: &permissions,
+            command_cwd: &workspace,
+            env_map: &env_map,
+            codex_home: &codex_home,
+            proxy_enforced: false,
+        };
+        let (_, default_roots) = build_payload_roots(
+            &request,
+            &super::SetupRootOverrides::default(),
+            super::SetupRuntime::Legacy,
+        );
+        assert!(default_roots.iter().any(|root| root.parent().is_none()));
+        super::validate_refresh_write_roots(&default_roots)
+            .expect_err("profile-derived root write ACE refused");
+
+        let (_, read_only_roots) = build_payload_roots(
+            &request,
+            &super::SetupRootOverrides {
+                write_roots: Some(Vec::new()),
+                ..super::SetupRootOverrides::default()
+            },
+            super::SetupRuntime::Legacy,
+        );
+        assert!(read_only_roots.is_empty());
+        super::validate_refresh_write_roots(&read_only_roots)
+            .expect("explicit no-write refresh is not rejected by profile alone");
+
+        let (_, scoped_roots) = build_payload_roots(
+            &request,
+            &super::SetupRootOverrides {
+                write_roots: Some(vec![workspace.clone()]),
+                ..super::SetupRootOverrides::default()
+            },
+            super::SetupRuntime::Legacy,
+        );
+        assert!(!scoped_roots.is_empty());
+        super::validate_refresh_write_roots(&scoped_roots)
+            .expect("explicit scoped writes are not rejected by profile alone");
     }
 
     fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf> {
