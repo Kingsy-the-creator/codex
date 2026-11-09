@@ -1,9 +1,8 @@
-# Control run: executes ONE pre-existing upstream test on the UNPATCHED base
-# commit c40729ea in the same hosted-runner environment as the
-# root-write-guards workflow. Purpose: show whether
-# manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper
-# fails on windows-latest without any guard patches applied.
-name: control direct-spawn test at base
+# Control run at the UNPATCHED base c40729ea with the same environment as the
+# root-write-guards workflow (long paths, short CARGO_HOME, TEMP off the 8.3 path,
+# helper executables built and placed next to the test binaries). Runs both crates'
+# full unit suites so their failures can be compared one-to-one with the patched run.
+name: control full suites at base
 on:
   workflow_dispatch:
   push:
@@ -29,9 +28,13 @@ jobs:
         run: |
           git config --global core.longpaths true
           "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+          "TMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
+          cache-on-failure: true
       - name: Confirm no guard code is present at this commit
         shell: pwsh
         run: |
@@ -39,10 +42,20 @@ jobs:
           if (Select-String -Path sandboxing/src/windows.rs -Pattern 'filesystem_root_write_root' -Quiet) { throw 'guard present' }
           if (Select-String -Path windows-sandbox-rs/src/setup.rs -Pattern 'validate_refresh_write_roots' -Quiet) { throw 'guard present' }
           Write-Host 'unpatched base confirmed'
-      - name: Run the one pre-existing test on the unpatched base
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
         shell: pwsh
         run: |
-          $out = cargo test -p codex-sandboxing --lib manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture 2>&1 | Tee-Object -Variable log
-          $out
-          if (-not ($log -match "running 1 test")) { throw "expected exactly one test to run; refusing a zero-test result" }
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+      - name: codex-sandboxing full unit suite at base
+        continue-on-error: true
+        run: cargo test -p codex-sandboxing --lib
+      - name: codex-windows-sandbox full unit suite at base
+        if: always()
+        continue-on-error: true
+        run: cargo test -p codex-windows-sandbox --lib
