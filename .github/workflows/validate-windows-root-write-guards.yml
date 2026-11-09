@@ -30,14 +30,39 @@ jobs:
         run: |
           git config --global core.longpaths true
           "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # The hosted runner's default TEMP is C:\Users\runneradmin\..., which Windows
+          # also exposes as the 8.3 short name C:\Users\RUNNER~1\...; tests that compare
+          # paths textually (deny_read_state, manager_tests) fail on that alone.
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+          "TMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
           cache-on-failure: true
       - name: Format check
         run: cargo fmt --check -p codex-windows-sandbox -p codex-sandboxing
+      # Upstream's Windows test job builds these two helpers and passes their paths
+      # to the tests through CARGO_BIN_EXE_* (rust-ci-full-nextest-platform.yml);
+      # `cargo test --lib` does not set them, so unified_exec tests otherwise fail
+      # with "failed to launch setup helper: program not found".
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
+        shell: pwsh
+        run: |
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Get-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" | Select-Object Name, Length
       - name: Require four named tests, run them, then both unit suites
         run: python ../.github/scripts/validate-root-write-guard-tests.py
+      # Skipped inside the driver as a proven pre-existing failure; run here alone,
+      # informationally, to learn whether the TEMP change above cures it.
+      - name: Informational - the skipped upstream test with TEMP off the 8.3 path
+        if: always()
+        continue-on-error: true
+        run: cargo test -p codex-sandboxing --lib manager::tests::transform_for_direct_spawn_windows_materializes_inner_helper -- --exact --nocapture
       - name: Full Windows sandbox suite, independently of sandboxing suite failure
         if: always()
         run: cargo test -p codex-windows-sandbox --lib
