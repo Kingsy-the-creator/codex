@@ -1141,7 +1141,8 @@ fn legacy_tty_cmd_emits_output_and_accepts_input() {
     });
 }
 
-/// Restores `USERPROFILE` when dropped.
+/// Points both `USERPROFILE` and the root-write expansion's account profile
+/// at a fixture, and restores them when dropped.
 struct UserProfileOverride(Option<std::ffi::OsString>);
 
 impl UserProfileOverride {
@@ -1151,12 +1152,14 @@ impl UserProfileOverride {
         // `--ignored --exact` and one test thread, so no other thread reads the
         // environment while it changes.
         unsafe { std::env::set_var("USERPROFILE", profile) };
+        crate::root_write_expansion::test_profile_override::set(Some(profile.to_path_buf()));
         Self(previous)
     }
 }
 
 impl Drop for UserProfileOverride {
     fn drop(&mut self) {
+        crate::root_write_expansion::test_profile_override::set(None);
         // SAFETY: see `UserProfileOverride::set`.
         unsafe {
             match self.0.take() {
@@ -1454,6 +1457,12 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
     assert!(
         granted.is_empty(),
         "sandbox obtained {granted:?} on a standard-user process (shares logon SID: {shares_logon_sid})\nstdout={stdout}"
+    );
+    // The user's clipboard is a window-station object outside the
+    // filesystem policy; the sandbox must not be able to open it.
+    assert!(
+        stdout.contains("PROBE clipboard opened=0 "),
+        "sandbox opened the user's clipboard, or the probe did not report it\nstdout={stdout}"
     );
     drop(victim);
     let _ = fs::remove_dir_all(&fixture_base);

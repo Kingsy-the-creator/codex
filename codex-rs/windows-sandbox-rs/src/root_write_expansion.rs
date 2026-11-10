@@ -231,6 +231,80 @@ fn real_child_dirs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The signed-in user's profile directory, used for root-write expansion, its
+/// deferred-execution protections and the setup refresh payload.
+///
+/// It comes from the account's profile entry through the process token
+/// (`GetUserProfileDirectoryW`), not from the inherited `USERPROFILE`
+/// environment variable, which whoever launches Codex can point at any
+/// directory. `None` when the account has no resolvable profile, so the
+/// expansion grants nothing rather than guessing.
+pub(crate) fn trusted_user_profile() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(profile) = test_profile_override::get() {
+        return Some(profile);
+    }
+    token_user_profile()
+}
+
+fn token_user_profile() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+    use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: opens this process's own token for query; closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut len = 0u32;
+    // SAFETY: a size query with a null buffer; `len` receives the size needed
+    // in wide characters, including the terminating NUL.
+    unsafe { GetUserProfileDirectoryW(token, std::ptr::null_mut(), &mut len) };
+    let mut buffer = vec![0u16; len as usize];
+    // SAFETY: `buffer` holds `len` wide characters, as the size query asked.
+    let ok = len != 0
+        && unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut len) } != 0;
+    // SAFETY: `token` was opened above and is not used after this.
+    unsafe { CloseHandle(token) };
+    if !ok {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(buffer.len());
+    let profile = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..end]));
+    profile.is_absolute().then_some(profile)
+}
+
+/// Test-only replacement for the token profile, so the elevated e2e can expand
+/// a fixture profile instead of re-ACLing the runner's real one.
+#[cfg(test)]
+pub(crate) mod test_profile_override {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static PROFILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    pub(crate) fn set(profile: Option<PathBuf>) {
+        *PROFILE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = profile;
+    }
+
+    pub(crate) fn get() -> Option<PathBuf> {
+        PROFILE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 fn known_folder(folder_id: &windows_sys::core::GUID) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;

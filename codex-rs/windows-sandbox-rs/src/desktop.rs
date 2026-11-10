@@ -37,6 +37,7 @@ use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
+use windows_sys::Win32::Security::Authorization::SET_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_WINDOW_OBJECT;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
 use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
@@ -260,16 +261,20 @@ impl LaunchDesktop {
     }
 }
 
-// Window-station specific rights (winuser.h WINSTA_ALL_ACCESS).
+// Window-station specific rights (winuser.h).
 const WINSTA_ALL_ACCESS: u32 = 0x037F;
+const WINSTA_ACCESSCLIPBOARD: u32 = 0x0004;
+const WINSTA_READSCREEN: u32 = 0x0200;
 /// The rights the interactive window station gives the caller's logon SID,
-/// without `DELETE`, `WRITE_DAC` or `WRITE_OWNER`. A narrower set (no
-/// `WINSTA_READSCREEN`, `WINSTA_WRITEATTRIBUTES`, `WINSTA_CREATEDESKTOP` or
-/// `WINSTA_EXITWINDOWS`) left user32-linked programs hanging at start-up on CI
-/// run 42913832024. Clipboard and screen access stay as they were before
-/// caller isolation; that is a recorded residual, not a change.
-const SANDBOX_WINDOW_STATION_ACCESS: u32 =
-    WINSTA_ALL_ACCESS | windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+/// without `DELETE`, `WRITE_DAC` or `WRITE_OWNER`, and without the clipboard
+/// and screen-reading rights, so a sandboxed command cannot read or replace the
+/// user's clipboard (`OpenClipboard` is authorised by the window station, not
+/// the private desktop). A narrower set (no `WINSTA_READSCREEN`,
+/// `WINSTA_WRITEATTRIBUTES`, `WINSTA_CREATEDESKTOP` or `WINSTA_EXITWINDOWS`)
+/// left user32-linked programs hanging at start-up on CI run 42913832024.
+const SANDBOX_WINDOW_STATION_ACCESS: u32 = (WINSTA_ALL_ACCESS
+    & !(WINSTA_ACCESSCLIPBOARD | WINSTA_READSCREEN))
+    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 
 /// Grants the sandbox account its own entry on the caller's window station.
 ///
@@ -278,8 +283,9 @@ const SANDBOX_WINDOW_STATION_ACCESS: u32 =
 /// sandboxed command's token holds that logon SID as deny-only (see
 /// `token::create_workspace_write_token_isolated_from_caller_from`), so it needs
 /// an entry for the sandbox account itself. Write-type checks still require the
-/// logon SID among the token's restricting SIDs. `GRANT_ACCESS` merges with an
-/// existing entry for the same account, so repeated calls do not grow the DACL.
+/// logon SID among the token's restricting SIDs. `SET_ACCESS` replaces any
+/// existing entry for the same account, so repeated calls do not grow the DACL
+/// and a wider grant left by an earlier build in this logon is narrowed.
 fn grant_window_station_to_sandbox(sandbox_sid: &str) -> Result<()> {
     use windows_sys::Win32::Security::ACL;
     use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
@@ -313,7 +319,7 @@ fn grant_window_station_to_sandbox(sandbox_sid: &str) -> Result<()> {
     }
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: SANDBOX_WINDOW_STATION_ACCESS,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: SET_ACCESS,
         grfInheritance: 0,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),

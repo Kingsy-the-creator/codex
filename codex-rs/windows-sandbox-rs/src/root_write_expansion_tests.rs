@@ -310,3 +310,13 @@ fn canonical_alias_denial_excludes_real_root_and_descendants() {
         keys(&[fake.profile.join("work")])
     );
 }
+
+#[test]
+fn trusted_profile_comes_from_the_process_token() {
+    // No test override is set here, so this is the account's profile as the
+    // token resolves it, independent of the `USERPROFILE` environment value.
+    let profile = token_user_profile().expect("the test account has a profile");
+    assert!(profile.is_absolute(), "{}", profile.display());
+    assert!(profile.is_dir(), "{}", profile.display());
+    assert!(!is_filesystem_root(&profile), "{}", profile.display());
+}

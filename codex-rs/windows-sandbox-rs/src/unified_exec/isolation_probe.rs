@@ -122,6 +122,12 @@ unsafe extern "system" {
     fn LocalFree(mem: *mut c_void) -> *mut c_void;
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn OpenClipboard(owner: Handle) -> i32;
+    fn CloseClipboard() -> i32;
+}
+
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn OpenProcessToken(process: Handle, desired_access: u32, token: *mut Handle) -> i32;
@@ -484,6 +490,14 @@ fn isolation_probe_child() {
             if !handle.is_null() {
                 CloseHandle(handle);
             }
+        }
+        // The clipboard belongs to the window station, not the private
+        // desktop, so only the window-station grant can keep it closed.
+        let opened = OpenClipboard(std::ptr::null_mut()) != 0;
+        let error = if opened { 0 } else { GetLastError() };
+        println!("PROBE clipboard opened={} error={error}", u8::from(opened));
+        if opened {
+            CloseClipboard();
         }
     }
     println!("PROBE done");

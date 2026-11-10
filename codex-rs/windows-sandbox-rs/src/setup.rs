@@ -32,6 +32,7 @@ use crate::root_write_expansion::RootWriteExpansion;
 use crate::root_write_expansion::deferred_execution_paths;
 use crate::root_write_expansion::expand_filesystem_root_write_roots;
 use crate::root_write_expansion::is_filesystem_root;
+use crate::root_write_expansion::trusted_user_profile;
 use crate::setup_error::SetupErrorCode;
 use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
@@ -386,13 +387,13 @@ fn setup_refresh_payload(
         overrides.write_roots.as_deref(),
     );
     let best_effort_write_roots = root_write_expanded_roots(&requested_write_roots, &write_roots);
+    let user_profile = trusted_user_profile();
     if !best_effort_write_roots.is_empty()
-        && let Some(user_profile) =
-            std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+        && let Some(user_profile) = user_profile.as_deref()
     {
         // Expanded profile roots must not let the command plant files that
         // Windows or the user's shell later runs as the user.
-        deny_write_paths.extend(deferred_execution_paths(Path::new(&user_profile)));
+        deny_write_paths.extend(deferred_execution_paths(user_profile));
     }
     let offline_proxy_settings =
         offline_proxy_settings_for_request(request, offline_proxy_settings_override);
@@ -410,9 +411,7 @@ fn setup_refresh_payload(
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         otel: None,
         real_user: crate::runtime_ownership::current_setup_user()?,
-        user_profile: std::env::var_os("USERPROFILE")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from),
+        user_profile,
         mode: SetupMode::Full,
         runtime,
         refresh_only: true,
@@ -749,10 +748,9 @@ pub(crate) fn effective_write_roots_for_permissions(
         write_roots_override,
     );
     // A filesystem-root write root cannot take an ACE; replace it with the
-    // real directories in the profile before the profile exclusions run.
-    let user_profile = std::env::var_os("USERPROFILE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+    // real directories in the profile before the profile exclusions run. The
+    // profile comes from the account, not the inherited environment.
+    let user_profile = trusted_user_profile();
     let is_read_denied = permissions.local_read_deny_predicate(command_cwd);
     let write_roots = expand_filesystem_root_write_roots(
         write_roots,
@@ -762,7 +760,29 @@ pub(crate) fn effective_write_roots_for_permissions(
             is_read_denied: is_read_denied.as_ref(),
         },
     );
-    filter_effective_write_roots(write_roots, codex_home)
+    let write_roots = filter_effective_write_roots(write_roots, codex_home);
+    // The shared profile filters key on the inherited `USERPROFILE`. Apply them
+    // again for the account's profile, so an environment value that differs
+    // from it cannot leave that profile's sensitive children writable. This
+    // only ever removes roots.
+    match user_profile.as_deref() {
+        Some(profile) => filter_profile_exclusions_for(write_roots, profile),
+        None => write_roots,
+    }
+}
+
+/// The profile filters of [`filter_effective_write_roots`] for an explicit
+/// profile: the profile root itself, [`USERPROFILE_ROOT_EXCLUSIONS`] and the
+/// SSH-config dependencies.
+fn filter_profile_exclusions_for(mut roots: Vec<PathBuf>, user_profile: &Path) -> Vec<PathBuf> {
+    let user_profile_key = canonical_path_key(user_profile);
+    let dependency_paths = ssh_config_dependency_paths(user_profile);
+    roots.retain(|root| {
+        canonical_path_key(root) != user_profile_key
+            && !is_user_profile_root_exclusion(root, user_profile)
+            && !is_ssh_config_dependency_root(root, user_profile, &dependency_paths)
+    });
+    roots
 }
 
 /// The unelevated (restricted-token) backend's effective write roots. It never
@@ -2607,6 +2627,38 @@ mod tests {
             &user_profile,
             &dependency_paths
         ));
+    }
+
+    #[test]
+    fn account_profile_exclusions_apply_whatever_the_environment_says() {
+        // `filter_effective_write_roots` keys on the inherited `USERPROFILE`,
+        // which here is not this fixture; the account-profile pass must still
+        // drop the profile root, its excluded children and SSH dependencies.
+        let tmp = TempDir::new().expect("tempdir");
+        let user_profile = tmp.path().join("account-profile");
+        let documents = user_profile.join("Documents");
+        let ssh_dir = user_profile.join(".ssh");
+        let aws_case_variant = user_profile.join(".AWS");
+        let key_dir = user_profile.join(".keys");
+        for dir in [&documents, &ssh_dir, &aws_case_variant, &key_dir] {
+            fs::create_dir_all(dir).expect("create profile child");
+        }
+        fs::write(ssh_dir.join("config"), "IdentityFile ~/.keys/id_ed25519\n")
+            .expect("write ssh config");
+        fs::write(key_dir.join("id_ed25519"), "").expect("write key");
+
+        let roots = super::filter_profile_exclusions_for(
+            vec![
+                user_profile.clone(),
+                documents.clone(),
+                ssh_dir,
+                aws_case_variant,
+                key_dir,
+            ],
+            &user_profile,
+        );
+
+        assert_eq!(roots, vec![documents]);
     }
 
     #[test]
