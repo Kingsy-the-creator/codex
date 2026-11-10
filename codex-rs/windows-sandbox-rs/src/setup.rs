@@ -28,6 +28,7 @@ use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+use crate::root_write_expansion::expand_filesystem_root_write_roots;
 use crate::setup_error::SetupErrorCode;
 use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
@@ -709,6 +710,10 @@ pub(crate) fn effective_write_roots_for_permissions(
     } else {
         gather_write_roots_for_permissions(permissions, command_cwd, env_map)
     };
+    // A filesystem-root write root (an approved `:root` write) cannot take an
+    // ACE; replace it with the roots the user controls on that volume before
+    // the profile expansion and exclusions run.
+    let write_roots = expand_filesystem_root_write_roots(write_roots);
     let write_roots = expand_user_profile_root(write_roots);
     let write_roots = filter_user_profile_root(write_roots);
     let write_roots = filter_user_profile_root_exclusions(write_roots);

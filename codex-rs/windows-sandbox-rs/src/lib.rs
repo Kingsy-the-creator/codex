@@ -175,6 +175,9 @@ mod proc_thread_attr;
 mod sandbox_utils;
 
 #[cfg(target_os = "windows")]
+mod root_write_expansion;
+
+#[cfg(target_os = "windows")]
 mod setup;
 
 #[cfg(target_os = "windows")]
