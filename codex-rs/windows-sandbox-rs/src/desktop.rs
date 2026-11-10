@@ -260,21 +260,16 @@ impl LaunchDesktop {
     }
 }
 
-// Window-station rights (winuser.h) the sandbox account needs to start
-// console and GUI-subsystem processes on its private desktop.
-const WINSTA_ENUMDESKTOPS: u32 = 0x0001;
-const WINSTA_READATTRIBUTES: u32 = 0x0002;
-const WINSTA_ACCESSCLIPBOARD: u32 = 0x0004;
-const WINSTA_ACCESSGLOBALATOMS: u32 = 0x0020;
-const WINSTA_ENUMERATE: u32 = 0x0100;
-/// No `WINSTA_READSCREEN`, `WINSTA_WRITEATTRIBUTES`, `WINSTA_CREATEDESKTOP`,
-/// `WINSTA_EXITWINDOWS`, `WRITE_DAC` or `WRITE_OWNER`.
-const SANDBOX_WINDOW_STATION_ACCESS: u32 = WINSTA_ENUMDESKTOPS
-    | WINSTA_READATTRIBUTES
-    | WINSTA_ACCESSCLIPBOARD
-    | WINSTA_ACCESSGLOBALATOMS
-    | WINSTA_ENUMERATE
-    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+// Window-station specific rights (winuser.h WINSTA_ALL_ACCESS).
+const WINSTA_ALL_ACCESS: u32 = 0x037F;
+/// The rights the interactive window station gives the caller's logon SID,
+/// without `DELETE`, `WRITE_DAC` or `WRITE_OWNER`. A narrower set (no
+/// `WINSTA_READSCREEN`, `WINSTA_WRITEATTRIBUTES`, `WINSTA_CREATEDESKTOP` or
+/// `WINSTA_EXITWINDOWS`) left user32-linked programs hanging at start-up on CI
+/// run 42913832024. Clipboard and screen access stay as they were before
+/// caller isolation; that is a recorded residual, not a change.
+const SANDBOX_WINDOW_STATION_ACCESS: u32 =
+    WINSTA_ALL_ACCESS | windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 
 /// Grants the sandbox account its own entry on the caller's window station.
 ///
