@@ -43,6 +43,9 @@ const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
 const LUA_TOKEN: u32 = 0x04;
 const WRITE_RESTRICTED: u32 = 0x08;
 const GENERIC_ALL: u32 = 0x1000_0000;
+const GENERIC_EXECUTE: u32 = 0x2000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const SE_GROUP_LOGON_ID: u32 = 0xC0000000;
 
@@ -53,30 +56,49 @@ struct TokenDefaultDaclInfo {
 
 /// Keep child-process and IPC access within the runner's logon session.
 /// Elevated runners have distinct logon SIDs even when they use the same account.
-unsafe fn set_default_dacl(h_token: HANDLE, logon_sid: *mut c_void) -> Result<()> {
+///
+/// `own_objects_group` is set for caller-isolated tokens, whose logon SID is
+/// deny-only. Their normal access check can then no longer use the logon SID,
+/// so the group (enabled in the token, never a restricting SID) carries the
+/// first check. Write-type rights still need the logon SID in the restricting
+/// check, so another logon of the same account gets no write-type access.
+unsafe fn set_default_dacl(
+    h_token: HANDLE,
+    logon_sid: *mut c_void,
+    own_objects_group: Option<*mut c_void>,
+) -> Result<()> {
     let owner_rights = LocalSid::from_string("S-1-3-4")?;
     // The shared account also owns these objects. An OWNER RIGHTS ACE suppresses
     // its implicit WRITE_DAC grant, which would otherwise let a different logon
     // rewrite this DACL. The creating logon retains full access explicitly.
-    let entries = [
+    let mut grants = vec![
         (logon_sid, GENERIC_ALL),
         (
             owner_rights.as_ptr(),
             windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
         ),
-    ]
-    .map(|(sid, access)| EXPLICIT_ACCESS_W {
-        grfAccessPermissions: access,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: 0,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid as *mut u16,
-        },
-    });
+    ];
+    if let Some(group) = own_objects_group {
+        // No WRITE_DAC, WRITE_OWNER or DELETE: those are not part of an
+        // object's generic write mapping, so a write-restricted token of
+        // another logon would not be stopped by its restricting SIDs.
+        grants.push((group, GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE));
+    }
+    let entries: Vec<EXPLICIT_ACCESS_W> = grants
+        .into_iter()
+        .map(|(sid, access)| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: access,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: 0,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid as *mut u16,
+            },
+        })
+        .collect();
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
     let res = SetEntriesInAclW(
         entries.len() as u32,
@@ -465,10 +487,112 @@ unsafe fn create_token_with_caps_user_and_additional_restrictions_from(
     create_token_with_caps_from(base_token, psid_capabilities, &extra_restricting_sids)
 }
 
+/// Like [`create_workspace_write_token_with_caps_and_user_from`], but the
+/// returned token cannot use the caller's logon SID to reach the caller's own
+/// processes.
+///
+/// `CreateProcessWithLogonW` gives the sandbox account the logon SID of the
+/// caller's session, and the default DACL of the caller's processes grants that
+/// SID read and execute access (`PROCESS_VM_READ`, `PROCESS_QUERY_INFORMATION`,
+/// `PROCESS_TERMINATE`). `WRITE_RESTRICTED` does not filter those rights. Here
+/// the logon SID is deny-only in the normal access check and stays a
+/// restricting SID, so the command keeps write-type access only where both the
+/// logon SID and its own groups allow it.
+///
+/// The token's own objects are granted generic read, write and execute for
+/// `CodexSandboxUsers`, which must be an enabled group of `base_token`. Another
+/// logon of the sandbox account can therefore read, query and terminate this
+/// command's processes, but cannot write to them, inject into them or change
+/// their DACL. The command itself cannot change the DACL of its own objects.
+///
+/// # Safety
+/// Caller must close the returned token handle; base_token must be a valid primary token.
+pub unsafe fn create_workspace_write_token_isolated_from_caller_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+    additional_restricting_sids: &[*mut c_void],
+) -> Result<HANDLE> {
+    let mut group = crate::winutil::resolve_sid(crate::winutil::SANDBOX_USERS_GROUP)?;
+    create_caller_isolated_token_from(
+        base_token,
+        psid_capabilities,
+        additional_restricting_sids,
+        &mut group,
+    )
+}
+
+/// The read-only counterpart of
+/// [`create_workspace_write_token_isolated_from_caller_from`].
+///
+/// # Safety
+/// Caller must close the returned token handle; base_token must be a valid primary token.
+pub unsafe fn create_readonly_token_isolated_from_caller_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+    additional_restricting_sids: &[*mut c_void],
+) -> Result<HANDLE> {
+    let mut group = crate::winutil::resolve_sid(crate::winutil::SANDBOX_USERS_GROUP)?;
+    create_caller_isolated_token_from(
+        base_token,
+        psid_capabilities,
+        additional_restricting_sids,
+        &mut group,
+    )
+}
+
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
+
+/// Builds a caller-isolated token whose own objects are granted to
+/// `own_objects_group`, which must be an enabled, non-deny-only group of
+/// `base_token` and must not be a restricting SID.
+unsafe fn create_caller_isolated_token_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+    additional_restricting_sids: &[*mut c_void],
+    own_objects_group: &mut [u8],
+) -> Result<HANDLE> {
+    let group_enabled = token_groups(base_token, 64 * 1024)?.iter().any(|group| {
+        group.sid == own_objects_group
+            && group.attributes & SE_GROUP_ENABLED != 0
+            && group.attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0
+    });
+    ensure!(
+        group_enabled,
+        "the sandbox token is not an enabled member of the group its own objects are granted to"
+    );
+    let mut user_sid_bytes = get_user_sid_bytes(base_token)?;
+    let mut extra_restricting_sids = Vec::with_capacity(additional_restricting_sids.len() + 1);
+    extra_restricting_sids.push(user_sid_bytes.as_mut_ptr() as *mut c_void);
+    extra_restricting_sids.extend_from_slice(additional_restricting_sids);
+    create_token_with_options_from(
+        base_token,
+        psid_capabilities,
+        &extra_restricting_sids,
+        Some(own_objects_group.as_mut_ptr() as *mut c_void),
+    )
+}
+
 unsafe fn create_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
     extra_restricting_sids: &[*mut c_void],
+) -> Result<HANDLE> {
+    create_token_with_options_from(
+        base_token,
+        psid_capabilities,
+        extra_restricting_sids,
+        /*own_objects_group*/ None,
+    )
+}
+
+/// `own_objects_group` makes the logon SID deny-only (see
+/// [`create_workspace_write_token_isolated_from_caller_from`]).
+unsafe fn create_token_with_options_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+    extra_restricting_sids: &[*mut c_void],
+    own_objects_group: Option<*mut c_void>,
 ) -> Result<HANDLE> {
     if psid_capabilities.is_empty() {
         return Err(anyhow!("no capability SIDs provided"));
@@ -496,13 +620,30 @@ unsafe fn create_token_with_caps_from(
     entries[logon_idx + 1].Sid = psid_everyone;
     entries[logon_idx + 1].Attributes = 0;
 
+    // A caller-isolated token keeps the logon SID only for deny ACEs, so the
+    // caller's processes (whose default DACL grants it read and execute) are
+    // out of reach. It remains a restricting SID for write-type checks.
+    let deny_only = [SID_AND_ATTRIBUTES {
+        Sid: psid_logon,
+        Attributes: 0,
+    }];
+    let deny_only: &[SID_AND_ATTRIBUTES] = if own_objects_group.is_some() {
+        &deny_only
+    } else {
+        &[]
+    };
+
     let mut new_token: HANDLE = std::ptr::null_mut();
     let flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED;
     let ok = CreateRestrictedToken(
         base_token,
         flags,
-        0,
-        std::ptr::null(),
+        deny_only.len() as u32,
+        if deny_only.is_empty() {
+            std::ptr::null()
+        } else {
+            deny_only.as_ptr()
+        },
         0,
         std::ptr::null(),
         entries.len() as u32,
@@ -515,7 +656,7 @@ unsafe fn create_token_with_caps_from(
 
     // Filesystem and route capabilities may be shared between launches. They
     // must not grant access to another launch's processes, threads, or IPC.
-    if let Err(error) = set_default_dacl(new_token, psid_logon)
+    if let Err(error) = set_default_dacl(new_token, psid_logon, own_objects_group)
         .and_then(|()| enable_single_privilege(new_token, "SeChangeNotifyPrivilege"))
     {
         CloseHandle(new_token);

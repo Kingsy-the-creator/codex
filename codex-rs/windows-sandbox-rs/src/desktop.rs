@@ -260,6 +260,110 @@ impl LaunchDesktop {
     }
 }
 
+// Window-station rights (winuser.h) the sandbox account needs to start
+// console and GUI-subsystem processes on its private desktop.
+const WINSTA_ENUMDESKTOPS: u32 = 0x0001;
+const WINSTA_READATTRIBUTES: u32 = 0x0002;
+const WINSTA_ACCESSCLIPBOARD: u32 = 0x0004;
+const WINSTA_ACCESSGLOBALATOMS: u32 = 0x0020;
+const WINSTA_ENUMERATE: u32 = 0x0100;
+/// No `WINSTA_READSCREEN`, `WINSTA_WRITEATTRIBUTES`, `WINSTA_CREATEDESKTOP`,
+/// `WINSTA_EXITWINDOWS`, `WRITE_DAC` or `WRITE_OWNER`.
+const SANDBOX_WINDOW_STATION_ACCESS: u32 = WINSTA_ENUMDESKTOPS
+    | WINSTA_READATTRIBUTES
+    | WINSTA_ACCESSCLIPBOARD
+    | WINSTA_ACCESSGLOBALATOMS
+    | WINSTA_ENUMERATE
+    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+
+/// Grants the sandbox account its own entry on the caller's window station.
+///
+/// The interactive window station grants the caller's logon SID, which
+/// `CreateProcessWithLogonW` also places in the sandbox account's token. The
+/// sandboxed command's token holds that logon SID as deny-only (see
+/// `token::create_workspace_write_token_isolated_from_caller_from`), so it needs
+/// an entry for the sandbox account itself. Write-type checks still require the
+/// logon SID among the token's restricting SIDs. `GRANT_ACCESS` merges with an
+/// existing entry for the same account, so repeated calls do not grow the DACL.
+fn grant_window_station_to_sandbox(sandbox_sid: &str) -> Result<()> {
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+    use windows_sys::Win32::System::StationsAndDesktops::GetProcessWindowStation;
+
+    let sid = crate::token::LocalSid::from_string(sandbox_sid)?;
+    // SAFETY: returns a pseudo-handle owned by the process; it is not closed.
+    let station = unsafe { GetProcessWindowStation() };
+    if station.is_null() {
+        anyhow::bail!("GetProcessWindowStation failed: {}", unsafe {
+            GetLastError()
+        });
+    }
+    let mut existing: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: out-pointers are valid; `descriptor` owns `existing` and is freed below.
+    let code = unsafe {
+        GetSecurityInfo(
+            station as _,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut existing,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != ERROR_SUCCESS {
+        anyhow::bail!("GetSecurityInfo failed for the window station: {code}");
+    }
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: SANDBOX_WINDOW_STATION_ACCESS,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.as_ptr() as *mut u16,
+        },
+    };
+    let mut updated: *mut ACL = ptr::null_mut();
+    // SAFETY: `entry` and `existing` stay valid for the call; `updated` is freed below.
+    let code = unsafe { SetEntriesInAclW(1, &entry, existing, &mut updated) };
+    let result = if code != ERROR_SUCCESS {
+        Err(anyhow::anyhow!(
+            "SetEntriesInAclW failed for the window station: {code}"
+        ))
+    } else {
+        // SAFETY: `station` is valid and `updated` is a well-formed ACL.
+        let code = unsafe {
+            SetSecurityInfo(
+                station as _,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                updated,
+                ptr::null_mut(),
+            )
+        };
+        if code == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "SetSecurityInfo failed for the window station: {code}"
+            ))
+        }
+    };
+    // SAFETY: both were allocated by the calls above (LocalFree accepts null).
+    unsafe {
+        LocalFree(updated as HLOCAL);
+        LocalFree(descriptor as HLOCAL);
+    }
+    result
+}
+
 /// Reuses a private desktop only for the same sandbox account and effective permissions.
 pub(crate) fn shared_private_desktop_for_user(
     sandbox_username: &str,
@@ -275,6 +379,10 @@ pub(crate) fn shared_private_desktop_for_user(
     let key = (sandbox_sid.clone(), policy.clone());
     if let Some(desktop) = desktops.get(&key) {
         return Ok(desktop.name.clone());
+    }
+    if let Err(error) = grant_window_station_to_sandbox(&sandbox_sid) {
+        logging::debug_log(&format!("{error:#}"), logs_base_dir);
+        return Err(error);
     }
 
     let owner_user_sid = unsafe {

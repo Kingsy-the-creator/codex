@@ -229,3 +229,309 @@ fn default_objects_deny_other_logons_even_with_the_same_owner() -> Result<()> {
     }
     Ok(())
 }
+
+mod caller_isolation {
+    //! The elevated command token against the caller's processes and against
+    //! another logon of the shared sandbox account.
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+    use windows_sys::Win32::Security::AccessCheck;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::DuplicateToken;
+    use windows_sys::Win32::Security::GENERIC_MAPPING;
+    use windows_sys::Win32::Security::GetAce;
+    use windows_sys::Win32::Security::InitializeSecurityDescriptor;
+    use windows_sys::Win32::Security::MapGenericMask;
+    use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+    use windows_sys::Win32::Security::SecurityImpersonation;
+    use windows_sys::Win32::Security::SetSecurityDescriptorDacl;
+    use windows_sys::Win32::Security::SetSecurityDescriptorGroup;
+    use windows_sys::Win32::Security::SetSecurityDescriptorOwner;
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+    use windows_sys::Win32::System::Threading::PROCESS_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::PROCESS_CREATE_PROCESS;
+    use windows_sys::Win32::System::Threading::PROCESS_CREATE_THREAD;
+    use windows_sys::Win32::System::Threading::PROCESS_DUP_HANDLE;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    use windows_sys::Win32::System::Threading::PROCESS_SET_INFORMATION;
+    use windows_sys::Win32::System::Threading::PROCESS_SET_QUOTA;
+    use windows_sys::Win32::System::Threading::PROCESS_SUSPEND_RESUME;
+    use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
+    use windows_sys::Win32::System::Threading::PROCESS_VM_OPERATION;
+    use windows_sys::Win32::System::Threading::PROCESS_VM_READ;
+    use windows_sys::Win32::System::Threading::PROCESS_VM_WRITE;
+
+    const CAPABILITY: &str = "S-1-5-21-10-20-30-40";
+    /// Stands in for the signed-in user. In production the sandbox token's user
+    /// is the sandbox account, so the caller's own user ACE never matches it.
+    const CALLER_USER: &str = "S-1-5-21-111-222-333-1001";
+
+    /// The process object type's generic mapping.
+    fn process_mapping() -> GENERIC_MAPPING {
+        GENERIC_MAPPING {
+            GenericRead: READ_CONTROL | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+            GenericWrite: READ_CONTROL
+                | PROCESS_CREATE_PROCESS
+                | PROCESS_CREATE_THREAD
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_DUP_HANDLE
+                | PROCESS_SET_INFORMATION
+                | PROCESS_SET_QUOTA
+                | PROCESS_SUSPEND_RESUME,
+            GenericExecute: READ_CONTROL
+                | SYNCHRONIZE
+                | PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_TERMINATE,
+            GenericAll: PROCESS_ALL_ACCESS,
+        }
+    }
+
+    /// An enabled, non-deny-only group of `token` that is neither its logon
+    /// SID nor Everyone, standing in for `CodexSandboxUsers`.
+    unsafe fn own_objects_group(token: HANDLE) -> Result<Vec<u8>> {
+        let everyone = world_sid()?;
+        token_groups(token, 64 * 1024)?
+            .into_iter()
+            .find(|group| {
+                group.attributes & SE_GROUP_ENABLED != 0
+                    && group.attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0
+                    && group.attributes & SE_GROUP_LOGON_ID != SE_GROUP_LOGON_ID
+                    && group.sid != everyone
+            })
+            .map(|group| group.sid)
+            .ok_or_else(|| anyhow!("test token has no usable enabled group"))
+    }
+
+    unsafe fn access_allowed(
+        descriptor: PSECURITY_DESCRIPTOR,
+        token: &OwnedHandle,
+        access: u32,
+    ) -> Result<bool> {
+        let mut impersonation = std::ptr::null_mut();
+        ensure!(
+            DuplicateToken(
+                token.as_raw_handle() as _,
+                SecurityImpersonation,
+                &mut impersonation
+            ) != 0,
+            "DuplicateToken failed: {}",
+            GetLastError()
+        );
+        let impersonation = OwnedHandle::from_raw_handle(impersonation as _);
+        let mapping = process_mapping();
+        let mut privileges = [0u64; 128];
+        let mut privilege_bytes = std::mem::size_of_val(&privileges) as u32;
+        let mut granted = 0;
+        let mut allowed = 0;
+        ensure!(
+            AccessCheck(
+                descriptor,
+                impersonation.as_raw_handle() as _,
+                access,
+                &mapping,
+                privileges.as_mut_ptr().cast(),
+                &mut privilege_bytes,
+                &mut granted,
+                &mut allowed
+            ) != 0,
+            "AccessCheck failed: {}",
+            GetLastError()
+        );
+        Ok(allowed != 0)
+    }
+
+    /// A self-relative security descriptor parsed from SDDL, freed on drop.
+    struct SddlDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl SddlDescriptor {
+        unsafe fn parse(sddl: &str) -> Result<Self> {
+            let wide = to_wide(sddl);
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            ensure!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut()
+                ) != 0,
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+                GetLastError()
+            );
+            Ok(Self(descriptor))
+        }
+    }
+
+    impl Drop for SddlDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe {
+                LocalFree(self.0 as HLOCAL);
+            }
+        }
+    }
+
+    unsafe fn isolated_token(base: HANDLE, capability: &LocalSid) -> Result<OwnedHandle> {
+        let mut group = own_objects_group(base)?;
+        Ok(OwnedHandle::from_raw_handle(
+            create_caller_isolated_token_from(base, &[capability.as_ptr()], &[], &mut group)? as _,
+        ))
+    }
+
+    #[test]
+    fn isolated_token_cannot_open_the_callers_processes() -> Result<()> {
+        unsafe {
+            let base = OwnedHandle::from_raw_handle(get_current_token_for_restriction()? as _);
+            let base_raw = base.as_raw_handle() as HANDLE;
+            let capability = LocalSid::from_string(CAPABILITY)?;
+            let isolated = isolated_token(base_raw, &capability)?;
+            let shared = OwnedHandle::from_raw_handle(
+                create_workspace_write_token_with_caps_and_user_from(
+                    base_raw,
+                    &[capability.as_ptr()],
+                    &[],
+                )? as _,
+            );
+            let logon = crate::winutil::string_from_sid_bytes(&get_logon_sid_bytes(base_raw)?)
+                .map_err(anyhow::Error::msg)?;
+            // A signed-in user's process: full access for the user and SYSTEM,
+            // generic read and execute for the session's logon SID.
+            let read_execute = process_mapping().GenericRead | process_mapping().GenericExecute;
+            let caller_process = SddlDescriptor::parse(&format!(
+                "O:{CALLER_USER}G:{CALLER_USER}D:(A;;0x{PROCESS_ALL_ACCESS:x};;;{CALLER_USER})(A;;0x{PROCESS_ALL_ACCESS:x};;;SY)(A;;0x{read_execute:x};;;{logon})"
+            ))?;
+            for access in [PROCESS_VM_READ, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE] {
+                assert!(
+                    access_allowed(caller_process.0, &shared, access)?,
+                    "model check: the shared-logon token should reach {access:#x}"
+                );
+                assert!(
+                    !access_allowed(caller_process.0, &isolated, access)?,
+                    "the caller-isolated token reached {access:#x} on the caller's process"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_default_objects_keep_write_access_within_the_logon() -> Result<()> {
+        unsafe {
+            let base = OwnedHandle::from_raw_handle(get_current_token_for_restriction()? as _);
+            let base_raw = base.as_raw_handle() as HANDLE;
+            let capability = LocalSid::from_string(CAPABILITY)?;
+            let isolated = isolated_token(base_raw, &capability)?;
+
+            let mut needed = 0;
+            GetTokenInformation(
+                isolated.as_raw_handle() as _,
+                TokenDefaultDacl,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            let mut buffer = vec![0u8; needed as usize];
+            ensure!(
+                GetTokenInformation(
+                    isolated.as_raw_handle() as _,
+                    TokenDefaultDacl,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed
+                ) != 0,
+                "GetTokenInformation(TokenDefaultDacl) failed: {}",
+                GetLastError()
+            );
+            let default_dacl =
+                std::ptr::read_unaligned(buffer.as_ptr().cast::<TokenDefaultDaclInfo>());
+            let mapping = process_mapping();
+            // Object creation maps the default DACL's generic masks.
+            for index in 0..u32::from((*default_dacl.default_dacl).AceCount) {
+                let mut ace = std::ptr::null_mut();
+                ensure!(GetAce(default_dacl.default_dacl, index, &mut ace) != 0);
+                MapGenericMask(&mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask, &mapping);
+            }
+            let mut owner = get_user_sid_bytes(base_raw)?;
+            let mut descriptor: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            let sd: PSECURITY_DESCRIPTOR = std::ptr::addr_of_mut!(descriptor).cast();
+            ensure!(InitializeSecurityDescriptor(sd, 1) != 0);
+            ensure!(SetSecurityDescriptorOwner(sd, owner.as_mut_ptr().cast(), 0) != 0);
+            ensure!(SetSecurityDescriptorGroup(sd, owner.as_mut_ptr().cast(), 0) != 0);
+            ensure!(SetSecurityDescriptorDacl(sd, 1, default_dacl.default_dacl, 0) != 0);
+
+            for access in [
+                PROCESS_VM_READ,
+                PROCESS_VM_WRITE,
+                PROCESS_VM_OPERATION,
+                PROCESS_CREATE_THREAD,
+                PROCESS_TERMINATE,
+                PROCESS_QUERY_INFORMATION,
+                SYNCHRONIZE,
+            ] {
+                assert!(
+                    access_allowed(sd, &isolated, access)?,
+                    "the command lost {access:#x} on its own objects"
+                );
+            }
+
+            // Another logon of the same account: logon SID deny-only, the same
+            // groups, and the shared user, Everyone and capability as
+            // restricting SIDs. Read-type access to this command's objects is
+            // the accepted cost of caller isolation; write-type access is not.
+            let mut logon = get_logon_sid_bytes(base_raw)?;
+            let mut everyone = world_sid()?;
+            let disabled = SID_AND_ATTRIBUTES {
+                Sid: logon.as_mut_ptr().cast(),
+                Attributes: 0,
+            };
+            let restricting = [
+                capability.as_ptr(),
+                owner.as_mut_ptr().cast(),
+                everyone.as_mut_ptr().cast(),
+            ]
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: 0,
+            });
+            let mut other = std::ptr::null_mut();
+            ensure!(
+                CreateRestrictedToken(
+                    base_raw,
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+                    1,
+                    &disabled,
+                    0,
+                    std::ptr::null(),
+                    restricting.len() as u32,
+                    restricting.as_ptr(),
+                    &mut other
+                ) != 0,
+                "CreateRestrictedToken(other logon) failed: {}",
+                GetLastError()
+            );
+            let other = OwnedHandle::from_raw_handle(other as _);
+            for access in [
+                PROCESS_VM_WRITE,
+                PROCESS_VM_OPERATION,
+                PROCESS_CREATE_THREAD,
+                PROCESS_DUP_HANDLE,
+                PROCESS_SET_INFORMATION,
+                PROCESS_SUSPEND_RESUME,
+                WRITE_DAC,
+            ] {
+                assert!(
+                    !access_allowed(sd, &other, access)?,
+                    "another logon gained {access:#x} on the command's objects"
+                );
+            }
+        }
+        Ok(())
+    }
+}
