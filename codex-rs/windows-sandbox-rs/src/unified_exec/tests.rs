@@ -1254,7 +1254,10 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
     // this policy: the volume as the write root, and each denial as both a
     // deny-read path and a read-only carveout.
     let write_roots_override = vec![volume];
-    let deny_paths = vec![secret.clone(), denied.clone()];
+    let deny_paths = vec![
+        AbsolutePathBuf::from_absolute_path(&secret).expect("absolute secret"),
+        AbsolutePathBuf::from_absolute_path(&denied).expect("absolute denied directory"),
+    ];
 
     let victim = isolation_probe::spawn_victim().expect("spawn medium-integrity victim");
     let cwd = profile.join("work");

@@ -107,11 +107,15 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $out = cargo test -p codex-windows-sandbox --lib -- setup:: acl token 2>&1
-          $code = $LASTEXITCODE
-          $out | ForEach-Object { Write-Output $_ }
-          $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=existing::$($_.Line)" }
-          exit $code
+          $failed = $false
+          foreach ($filter in @('setup::', 'acl', 'token')) {
+            $out = cargo test -p codex-windows-sandbox --lib $filter 2>&1
+            $code = $LASTEXITCODE
+            $out | ForEach-Object { Write-Output $_ }
+            $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=existing-$filter::$($_.Line)" }
+            if ($code -ne 0 -or -not ($out -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
       - name: Full Windows sandbox suite (reported; four legacy failures pre-date this branch)
         if: always()
         continue-on-error: true
