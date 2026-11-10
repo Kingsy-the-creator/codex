@@ -112,7 +112,7 @@ jobs:
             $out = cargo test -p codex-windows-sandbox --lib $filter 2>&1
             $code = $LASTEXITCODE
             $out | ForEach-Object { Write-Output $_ }
-            $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=existing-$filter::$($_.Line)" }
+            $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=existing-${filter}::$($_.Line)" }
             if ($code -ne 0 -or -not ($out -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { $failed = $true }
           }
           if ($failed) { exit 1 }
