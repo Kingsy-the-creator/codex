@@ -469,6 +469,17 @@ fn isolation_probe_child() {
                         CloseHandle(token);
                     }
                 }
+            } else if *name == "query_limited" {
+                // Without a process handle the token cannot be opened at all;
+                // report both token rights as denied with the open's error.
+                for (token_name, token_mask) in [
+                    ("token_query", TOKEN_QUERY),
+                    ("token_duplicate", TOKEN_DUPLICATE),
+                ] {
+                    println!(
+                        "PROBE open name={token_name} mask=0x{token_mask:x} granted=0 error={error}"
+                    );
+                }
             }
             if !handle.is_null() {
                 CloseHandle(handle);
