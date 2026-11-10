@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 
 pub(super) const PROBE_PID_ENV: &str = "CODEX_ISOLATION_PROBE_PID";
-pub(super) const PROBE_TEST_NAME: &str = "unified_exec::tests::isolation_probe::isolation_probe_child";
+pub(super) const PROBE_TEST_NAME: &str =
+    "unified_exec::tests::isolation_probe::isolation_probe_child";
 
 type Handle = *mut c_void;
 
@@ -50,7 +51,10 @@ const MEDIUM_INTEGRITY_SID: &str = "S-1-16-8192";
 /// Rights whose grant would let the sandbox tamper with, inject into, read or
 /// stop the user's process. Each is probed on its own.
 pub(super) const PROBED_RIGHTS: &[(&str, u32)] = &[
-    ("vm_write_operation", PROCESS_VM_WRITE | PROCESS_VM_OPERATION),
+    (
+        "vm_write_operation",
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+    ),
     ("create_thread", PROCESS_CREATE_THREAD),
     ("dup_handle", PROCESS_DUP_HANDLE),
     ("create_process", PROCESS_CREATE_PROCESS),
@@ -275,7 +279,10 @@ pub(super) fn spawn_victim() -> Result<Victim, String> {
         LocalFree(medium_sid);
         if lowered == 0 {
             CloseHandle(token);
-            return Err(format!("SetTokenInformation(IL) failed: {}", GetLastError()));
+            return Err(format!(
+                "SetTokenInformation(IL) failed: {}",
+                GetLastError()
+            ));
         }
         let sddl = format!("D:(A;;GA;;;{user_sid})(A;;GA;;;SY)(A;;GRGX;;;{logon_sid})");
         let mut sd: *mut c_void = std::ptr::null_mut();
@@ -339,7 +346,11 @@ pub(super) fn parse_open_results(stdout: &str) -> BTreeMap<String, (bool, u32)> 
                 if let Some(value) = field.strip_prefix("name=") {
                     name = Some(value.to_string());
                 } else if let Some(value) = field.strip_prefix("granted=") {
-                    granted = match value { "0" => Some(false), "1" => Some(true), _ => None };
+                    granted = match value {
+                        "0" => Some(false),
+                        "1" => Some(true),
+                        _ => None,
+                    };
                 } else if let Some(value) = field.strip_prefix("error=") {
                     error = value.parse::<u32>().ok();
                 }
@@ -358,11 +369,21 @@ unsafe fn token_sids(token: Handle, class: i32) -> Vec<(String, u32)> {
             return Vec::new();
         }
         let mut buffer = vec![0u8; needed as usize];
-        if GetTokenInformation(token, class, buffer.as_mut_ptr().cast(), needed, &mut needed) == 0 {
+        if GetTokenInformation(
+            token,
+            class,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
             return Vec::new();
         }
         let count = std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>()) as usize;
-        let first = buffer.as_ptr().add(std::mem::size_of::<usize>()).cast::<SidAndAttributes>();
+        let first = buffer
+            .as_ptr()
+            .add(std::mem::size_of::<usize>())
+            .cast::<SidAndAttributes>();
         (0..count)
             .map(|index| {
                 let entry = std::ptr::read_unaligned(first.add(index));
@@ -407,8 +428,7 @@ fn isolation_probe_child() {
                 &mut needed,
             ) != 0
             {
-                let entry =
-                    std::ptr::read_unaligned(integrity.as_ptr().cast::<SidAndAttributes>());
+                let entry = std::ptr::read_unaligned(integrity.as_ptr().cast::<SidAndAttributes>());
                 println!("PROBE token integrity={}", sid_string(entry.sid));
             }
             match token_groups(own_token, 1 << 20) {
@@ -434,9 +454,10 @@ fn isolation_probe_child() {
                 u8::from(!handle.is_null())
             );
             if *name == "query_limited" && !handle.is_null() {
-                for (token_name, token_mask) in
-                    [("token_query", TOKEN_QUERY), ("token_duplicate", TOKEN_DUPLICATE)]
-                {
+                for (token_name, token_mask) in [
+                    ("token_query", TOKEN_QUERY),
+                    ("token_duplicate", TOKEN_DUPLICATE),
+                ] {
                     let mut token: Handle = std::ptr::null_mut();
                     let opened = OpenProcessToken(handle, token_mask, &mut token) != 0;
                     let error = if opened { 0 } else { GetLastError() };

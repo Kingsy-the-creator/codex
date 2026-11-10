@@ -125,21 +125,33 @@ impl ResolvedWindowsSandboxPermissions {
         // so an alias denial also excludes its real target from write grants.
         let planned = AbsolutePathBuf::from_absolute_path(cwd)
             .map_err(|err| err.to_string())
-            .and_then(|cwd| crate::deny_read_resolver::resolve_windows_deny_read_paths(&self.file_system, &cwd))
+            .and_then(|cwd| {
+                crate::deny_read_resolver::resolve_windows_deny_read_paths(&self.file_system, &cwd)
+            })
             .and_then(|paths| {
-                let paths: Vec<PathBuf> = paths.into_iter().map(AbsolutePathBuf::into_path_buf).collect();
-                crate::deny_read_acl::plan_deny_read_acl_paths(&paths).map_err(|err| err.to_string())
+                let paths: Vec<PathBuf> = paths
+                    .into_iter()
+                    .map(AbsolutePathBuf::into_path_buf)
+                    .collect();
+                crate::deny_read_acl::plan_deny_read_acl_paths(&paths)
+                    .map_err(|err| err.to_string())
             });
         let Ok(planned) = planned else {
             return Box::new(|_: &Path| true);
         };
-        let denied_keys: Vec<String> = planned.iter()
-            .map(|path| crate::path_normalization::canonical_path_key(path)).collect();
+        let denied_keys: Vec<String> = planned
+            .iter()
+            .map(|path| crate::path_normalization::canonical_path_key(path))
+            .collect();
         match ReadDenyMatcher::try_new_for_local_paths(&self.file_system, cwd) {
             Ok(matcher) => Box::new(move |path: &Path| {
                 let key = crate::path_normalization::canonical_path_key(path);
-                matcher.as_ref().is_some_and(|matcher| matcher.is_local_path_read_denied(path))
-                    || denied_keys.iter().any(|denied| Path::new(&key).starts_with(denied))
+                matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_local_path_read_denied(path))
+                    || denied_keys
+                        .iter()
+                        .any(|denied| Path::new(&key).starts_with(denied))
             }),
             Err(_) => Box::new(|_: &Path| true),
         }

@@ -112,7 +112,13 @@ pub(crate) fn expand_filesystem_root_write_roots(
             if is_root_write_profile_exclusion(&child) {
                 continue;
             }
-            split_around_protected_paths(child, &protected_keys, expansion.is_read_denied, 0, &mut from_profile);
+            split_around_protected_paths(
+                child,
+                &protected_keys,
+                expansion.is_read_denied,
+                0,
+                &mut from_profile,
+            );
         }
         // Only the roots this expansion adds are filtered here; explicit write
         // roots keep the policy's own precedence rules.
@@ -157,12 +163,9 @@ fn deferred_execution_candidates(user_profile: &Path) -> Vec<PathBuf> {
 
 fn profile_is_on_volume(profile: &Path, volume: &Path) -> bool {
     !is_filesystem_root(profile)
-        && profile
-            .ancestors()
-            .last()
-            .is_some_and(|profile_volume| {
-                canonical_path_key(profile_volume) == canonical_path_key(volume)
-            })
+        && profile.ancestors().last().is_some_and(|profile_volume| {
+            canonical_path_key(profile_volume) == canonical_path_key(volume)
+        })
 }
 
 fn is_root_write_profile_exclusion(path: &Path) -> bool {
@@ -188,11 +191,17 @@ fn split_around_protected_paths(
         return;
     }
     let root_key = canonical_path_key(&root);
-    if protected_keys.iter().any(|key| Path::new(&root_key).starts_with(key)) {
+    if protected_keys
+        .iter()
+        .any(|key| Path::new(&root_key).starts_with(key))
+    {
         return;
     }
     let root_prefix = format!("{}/", root_key.trim_end_matches('/'));
-    if !protected_keys.iter().any(|key| key.starts_with(&root_prefix)) {
+    if !protected_keys
+        .iter()
+        .any(|key| key.starts_with(&root_prefix))
+    {
         out.push(root);
         return;
     }

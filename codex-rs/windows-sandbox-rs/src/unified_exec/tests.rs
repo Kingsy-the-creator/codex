@@ -1213,8 +1213,11 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
     }
     fs::write(profile.join(r"data\sibling.txt"), "SIBLING-READABLE").expect("write sibling");
     fs::write(profile.join(r"data\secret.txt"), "SECRET-MUST-NOT-LEAK").expect("write secret");
-    fs::write(profile.join(r"denied\inner.txt"), "DENIED-DIR-MUST-NOT-LEAK")
-        .expect("write inner");
+    fs::write(
+        profile.join(r"denied\inner.txt"),
+        "DENIED-DIR-MUST-NOT-LEAK",
+    )
+    .expect("write inner");
     let probe_exe = profile.join(r"bin\probe.exe");
     fs::copy(std::env::current_exe().expect("test exe"), &probe_exe).expect("copy probe exe");
     let root_file = PathBuf::from(format!(
@@ -1337,8 +1340,7 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
                 )
             });
             let (stdout, exit_code) =
-                collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(150))
-                    .await;
+                collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(150)).await;
             let stdout = String::from_utf8_lossy(&stdout).into_owned();
             assert_eq!(
                 exit_code,
@@ -1363,7 +1365,10 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
     assert!(stdout.contains("SIBLING-READABLE"), "stdout={stdout}");
     // Denied paths stay unreadable and unwritable.
     assert!(!stdout.contains("SECRET-MUST-NOT-LEAK"), "stdout={stdout}");
-    assert!(!stdout.contains("DENIED-DIR-MUST-NOT-LEAK"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("DENIED-DIR-MUST-NOT-LEAK"),
+        "stdout={stdout}"
+    );
     assert_eq!(
         fs::read_to_string(&secret).expect("read secret"),
         "SECRET-MUST-NOT-LEAK"
@@ -1387,9 +1392,18 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         "write into the PowerShell profile folder"
     );
     let programs = profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs");
-    assert!(programs.join("Startup").is_dir(), "setup did not materialise Startup, or its ancestor was renamed");
-    assert!(!programs.join(r"Startup\probe.cmd").exists(), "write into Startup");
-    assert!(!programs.with_file_name("Programs-moved").exists(), "renamed a protected ancestor");
+    assert!(
+        programs.join("Startup").is_dir(),
+        "setup did not materialise Startup, or its ancestor was renamed"
+    );
+    assert!(
+        !programs.join(r"Startup\probe.cmd").exists(),
+        "write into Startup"
+    );
+    assert!(
+        !programs.with_file_name("Programs-moved").exists(),
+        "renamed a protected ancestor"
+    );
     assert!(
         !not_expanded.join("new.txt").exists(),
         "write outside the profile"
@@ -1420,12 +1434,19 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         victim.logon_sid
     );
     assert!(victim.is_running(), "victim was stopped");
-    for name in isolation_probe::PROBED_RIGHTS.iter().map(|(name, _)| *name)
+    for name in isolation_probe::PROBED_RIGHTS
+        .iter()
+        .map(|(name, _)| *name)
         .chain(["token_query", "token_duplicate"])
     {
-        let (granted, error) = rights.get(name)
+        let (granted, error) = rights
+            .get(name)
             .unwrap_or_else(|| panic!("missing probe result for {name}: {stdout}"));
-        assert_eq!(*error, if *granted { 0 } else { 5 }, "unexpected error for {name}: {stdout}");
+        assert_eq!(
+            *error,
+            if *granted { 0 } else { 5 },
+            "unexpected error for {name}: {stdout}"
+        );
     }
     assert!(
         granted.is_empty(),

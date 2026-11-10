@@ -25,8 +25,8 @@ use crate::local_user_flags;
 use crate::log_note;
 use crate::log_writer;
 use crate::open_directory_no_reparse;
-use crate::path_normalization::canonical_path_key;
 use crate::path_mask_allows;
+use crate::path_normalization::canonical_path_key;
 use crate::path_write_aces_need_refresh;
 use crate::resolve_sid;
 use crate::sandbox_bin_dir;
@@ -1177,7 +1177,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         });
     }
 
-    let deferred_paths = payload.user_profile.as_deref()
+    let deferred_paths = payload
+        .user_profile
+        .as_deref()
         .map(crate::root_write_expansion::deferred_execution_paths)
         .unwrap_or_default();
     for path in &payload.deny_write_paths {
@@ -1198,7 +1200,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         // as a carveout of the volume root. One that no expanded root covers
         // needs no deny ACE and must not create a stray directory.
         if !payload.best_effort_write_roots.is_empty()
-            && !deferred_paths.iter().any(|deferred| canonical_path_key(deferred) == canonical_path_key(path))
+            && !deferred_paths
+                .iter()
+                .any(|deferred| canonical_path_key(deferred) == canonical_path_key(path))
             && !payload
                 .write_roots
                 .iter()

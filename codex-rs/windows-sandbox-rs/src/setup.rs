@@ -351,7 +351,12 @@ fn run_setup_refresh_inner(
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
     runtime: SetupRuntime,
 ) -> Result<()> {
-    let payload = setup_refresh_payload(&request, overrides, offline_proxy_settings_override, runtime)?;
+    let payload = setup_refresh_payload(
+        &request,
+        overrides,
+        offline_proxy_settings_override,
+        runtime,
+    )?;
     let json = serde_json::to_vec(&payload)?;
     let b64 = BASE64_STANDARD.encode(json);
     run_setup_singleflight(b64.clone(), || {
@@ -380,10 +385,10 @@ fn setup_refresh_payload(
         request.env_map,
         overrides.write_roots.as_deref(),
     );
-    let best_effort_write_roots =
-        root_write_expanded_roots(&requested_write_roots, &write_roots);
+    let best_effort_write_roots = root_write_expanded_roots(&requested_write_roots, &write_roots);
     if !best_effort_write_roots.is_empty()
-        && let Some(user_profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+        && let Some(user_profile) =
+            std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
     {
         // Expanded profile roots must not let the command plant files that
         // Windows or the user's shell later runs as the user.
@@ -806,8 +811,10 @@ fn root_write_expanded_roots(requested: &[PathBuf], effective: &[PathBuf]) -> Ve
     if !requested.iter().any(|root| is_filesystem_root(root)) {
         return Vec::new();
     }
-    let requested_keys: HashSet<String> =
-        requested.iter().map(|root| canonical_path_key(root)).collect();
+    let requested_keys: HashSet<String> = requested
+        .iter()
+        .map(|root| canonical_path_key(root))
+        .collect();
     effective
         .iter()
         .filter(|root| !requested_keys.contains(&canonical_path_key(root)))
@@ -1823,7 +1830,11 @@ mod tests {
         // CI TEMP may be on D: while USERPROFILE is on C:. Exercise expansion
         // on the profile's volume rather than accidentally testing an empty set.
         let profile_dir = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE"));
-        let profile_volume = profile_dir.ancestors().last().expect("profile volume").to_path_buf();
+        let profile_volume = profile_dir
+            .ancestors()
+            .last()
+            .expect("profile volume")
+            .to_path_buf();
         let payload = super::setup_refresh_payload(
             &request,
             super::SetupRootOverrides {
@@ -1833,13 +1844,20 @@ mod tests {
             },
             None,
             super::SetupRuntime::Legacy,
-        ).expect("build root-write refresh payload");
-        assert!(!payload.write_roots.is_empty(), "fixture needs profile write roots");
+        )
+        .expect("build root-write refresh payload");
+        assert!(
+            !payload.write_roots.is_empty(),
+            "fixture needs profile write roots"
+        );
         assert_eq!(payload.best_effort_write_roots, payload.write_roots);
         assert_eq!(payload.deny_read_paths, vec![private.clone()]);
         let user_profile = payload.user_profile.as_deref().expect("profile");
         for path in super::deferred_execution_paths(user_profile) {
-            assert!(payload.deny_write_paths.contains(&path), "missing carveout {path:?}");
+            assert!(
+                payload.deny_write_paths.contains(&path),
+                "missing carveout {path:?}"
+            );
         }
         super::validate_refresh_write_roots(&[volume])
             .expect_err("a literal filesystem root is still refused");

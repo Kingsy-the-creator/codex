@@ -179,7 +179,9 @@ fn elevated_scoped_write_with_retained_denied_read_is_accepted() {
             ),
             FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
             FileSystemSandboxEntry::new(
-                AbsolutePathBuf::from_absolute_path(&private).unwrap().into(),
+                AbsolutePathBuf::from_absolute_path(&private)
+                    .unwrap()
+                    .into(),
                 FileSystemAccessMode::Deny,
             ),
         ]),
