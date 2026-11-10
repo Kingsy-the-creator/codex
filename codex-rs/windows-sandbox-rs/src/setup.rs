@@ -28,7 +28,10 @@ use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+use crate::root_write_expansion::RootWriteExpansion;
+use crate::root_write_expansion::deferred_execution_paths;
 use crate::root_write_expansion::expand_filesystem_root_write_roots;
+use crate::root_write_expansion::is_filesystem_root;
 use crate::setup_error::SetupErrorCode;
 use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
@@ -356,7 +359,22 @@ fn run_setup_refresh_inner(
     // explicit overrides. A profile-level check also rejects read-only refreshes.
     validate_refresh_write_roots(&write_roots)?;
     let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
-    let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let mut deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let requested_write_roots = requested_write_roots_for_permissions(
+        request.permissions,
+        request.command_cwd,
+        request.env_map,
+        overrides.write_roots.as_deref(),
+    );
+    let best_effort_write_roots =
+        root_write_expanded_roots(&requested_write_roots, &write_roots);
+    if !best_effort_write_roots.is_empty()
+        && let Some(user_profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+    {
+        // Expanded profile roots must not let the command plant files that
+        // Windows or the user's shell later runs as the user.
+        deny_write_paths.extend(deferred_execution_paths(Path::new(&user_profile)));
+    }
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let payload = ElevationPayload {
@@ -379,6 +397,7 @@ fn run_setup_refresh_inner(
         mode: SetupMode::Full,
         runtime,
         refresh_only: true,
+        best_effort_write_roots,
     };
     let json = serde_json::to_vec(&payload)?;
     let b64 = BASE64_STANDARD.encode(json);
@@ -698,6 +717,9 @@ pub(crate) fn effective_write_roots_for_setup(
     )
 }
 
+/// The elevated backend's effective write roots: the requested roots, with a
+/// filesystem root (an approved `:root` write) expanded into the profile's
+/// real directories, then the profile expansion and exclusions.
 pub(crate) fn effective_write_roots_for_permissions(
     permissions: &ResolvedWindowsSandboxPermissions,
     command_cwd: &Path,
@@ -705,20 +727,82 @@ pub(crate) fn effective_write_roots_for_permissions(
     codex_home: &Path,
     write_roots_override: Option<&[PathBuf]>,
 ) -> Vec<PathBuf> {
-    let write_roots = if let Some(roots) = write_roots_override {
+    let write_roots = requested_write_roots_for_permissions(
+        permissions,
+        command_cwd,
+        env_map,
+        write_roots_override,
+    );
+    // A filesystem-root write root cannot take an ACE; replace it with the
+    // real directories in the profile before the profile exclusions run.
+    let user_profile = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let is_read_denied = permissions.local_read_deny_predicate(command_cwd);
+    let write_roots = expand_filesystem_root_write_roots(
+        write_roots,
+        &RootWriteExpansion {
+            user_profile: user_profile.as_deref(),
+            codex_home,
+            is_read_denied: is_read_denied.as_ref(),
+        },
+    );
+    filter_effective_write_roots(write_roots, codex_home)
+}
+
+/// The unelevated (restricted-token) backend's effective write roots. It never
+/// expands a filesystem root: that backend cannot enforce the deny-read paths
+/// such a policy carries, so its resolver refuses those policies first.
+pub(crate) fn effective_legacy_write_roots_for_permissions(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    write_roots_override: Option<&[PathBuf]>,
+) -> Vec<PathBuf> {
+    let write_roots = requested_write_roots_for_permissions(
+        permissions,
+        command_cwd,
+        env_map,
+        write_roots_override,
+    );
+    filter_effective_write_roots(write_roots, codex_home)
+}
+
+fn requested_write_roots_for_permissions(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    write_roots_override: Option<&[PathBuf]>,
+) -> Vec<PathBuf> {
+    if let Some(roots) = write_roots_override {
         canonical_existing(roots)
     } else {
         gather_write_roots_for_permissions(permissions, command_cwd, env_map)
-    };
-    // A filesystem-root write root (an approved `:root` write) cannot take an
-    // ACE; replace it with the roots the user controls on that volume before
-    // the profile expansion and exclusions run.
-    let write_roots = expand_filesystem_root_write_roots(write_roots);
+    }
+}
+
+fn filter_effective_write_roots(write_roots: Vec<PathBuf>, codex_home: &Path) -> Vec<PathBuf> {
     let write_roots = expand_user_profile_root(write_roots);
     let write_roots = filter_user_profile_root(write_roots);
     let write_roots = filter_user_profile_root_exclusions(write_roots);
     let write_roots = filter_ssh_config_dependency_roots(write_roots);
     filter_sensitive_write_roots(write_roots, codex_home)
+}
+
+/// The effective roots a filesystem-root expansion added: empty unless a
+/// requested root was a filesystem root.
+fn root_write_expanded_roots(requested: &[PathBuf], effective: &[PathBuf]) -> Vec<PathBuf> {
+    if !requested.iter().any(|root| is_filesystem_root(root)) {
+        return Vec::new();
+    }
+    let requested_keys: HashSet<String> =
+        requested.iter().map(|root| canonical_path_key(root)).collect();
+    effective
+        .iter()
+        .filter(|root| !requested_keys.contains(&canonical_path_key(root)))
+        .cloned()
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -746,6 +830,11 @@ struct ElevationPayload {
     runtime: SetupRuntime,
     #[serde(default)]
     refresh_only: bool,
+    /// Write roots added by a filesystem-root expansion. A failed grant on one
+    /// of these is logged and skipped rather than failing the refresh: its
+    /// capability SID then matches no ACE, so the root stays unwritable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    best_effort_write_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1193,6 +1282,7 @@ fn elevated_provisioning_payload(
         mode: SetupMode::InteractiveProvision,
         runtime: SetupRuntime::Legacy,
         refresh_only: false,
+        best_effort_write_roots: Vec::new(),
     }
 }
 
@@ -1276,6 +1366,7 @@ pub fn run_elevated_provisioning_setup_with_retained_handles(
         mode: SetupMode::ProvisionOnly,
         runtime,
         refresh_only: false,
+        best_effort_write_roots: Vec::new(),
     };
     run_setup_exe(
         &payload,
@@ -1703,9 +1794,24 @@ mod tests {
             &super::SetupRootOverrides::default(),
             super::SetupRuntime::Legacy,
         );
-        assert!(default_roots.iter().any(|root| root.parent().is_none()));
+        // A symbolic `:root` write is expanded before validation: the volume
+        // root never reaches the ACE step, which still refuses it as a backstop.
+        assert!(
+            default_roots.iter().all(|root| root.parent().is_some()),
+            "{default_roots:?}"
+        );
         super::validate_refresh_write_roots(&default_roots)
-            .expect_err("profile-derived root write ACE refused");
+            .expect("expanded root write ACEs are scoped");
+        let private_key = crate::path_normalization::canonical_path_key(&private);
+        assert!(
+            default_roots
+                .iter()
+                .all(|root| crate::path_normalization::canonical_path_key(root) != private_key),
+            "{default_roots:?}"
+        );
+        let volume = workspace.ancestors().last().expect("volume").to_path_buf();
+        super::validate_refresh_write_roots(&[volume])
+            .expect_err("a literal filesystem root is still refused");
 
         let (_, read_only_roots) = build_payload_roots(
             &request,

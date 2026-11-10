@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::WritableRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -255,12 +257,15 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     let split_writable_roots =
         file_system_sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
     // The elevated backend grants write access by adding ACEs to each writable
-    // root from the unelevated setup refresh. Granting an ACE on the system
-    // drive root failed with access denied in the reported setup refresh. A
-    // root-write policy with carveouts can reach that path even though it is
-    // not classified as full-disk write access. Refuse root-write policies
-    // here, before any helper is spawned, with an actionable message.
-    if let Some(root) = filesystem_root_write_root(&split_writable_roots) {
+    // root from the unelevated setup refresh, and cannot add one to a
+    // filesystem root. The symbolic `:root` write grant (an approved command
+    // that keeps its deny-read carveouts) is expanded by the backend into the
+    // real directories of the user profile instead. An explicit filesystem-root
+    // write entry such as `C:\ = write` is still refused here, before any
+    // helper is spawned, with an actionable message.
+    if let Some(root) =
+        explicit_filesystem_root_write_root(&file_system_sandbox_policy, sandbox_policy_cwd)
+    {
         return Err(format!(
             "windows elevated sandbox will not grant write access to filesystem root {}; request scoped filesystem permissions for the directories the command needs instead of escalating",
             root.display()
@@ -414,6 +419,25 @@ fn filesystem_root_write_root(writable_roots: &[WritableRoot]) -> Option<&Path> 
         .iter()
         .map(|writable_root| writable_root.root.as_path())
         .find(|root| root.parent().is_none())
+}
+
+/// Returns a filesystem root that stays writable once symbolic `:root` write
+/// entries are set aside, i.e. one an explicit path entry makes writable.
+fn explicit_filesystem_root_write_root(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+) -> Option<PathBuf> {
+    let mut without_symbolic_root_write = file_system_sandbox_policy.clone();
+    without_symbolic_root_write.entries.retain(|entry| {
+        !(matches!(
+            &entry.path,
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root
+            }
+        ) && entry.access.can_write())
+    });
+    let writable_roots = without_symbolic_root_write.get_writable_roots_with_cwd(cwd);
+    filesystem_root_write_root(&writable_roots).map(Path::to_path_buf)
 }
 
 fn has_reopened_writable_descendant(writable_roots: &[WritableRoot]) -> bool {

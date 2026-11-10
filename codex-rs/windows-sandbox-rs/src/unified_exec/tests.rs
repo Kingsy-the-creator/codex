@@ -1,5 +1,8 @@
 #![cfg(target_os = "windows")]
 
+#[path = "isolation_probe.rs"]
+mod isolation_probe;
+
 use super::WindowsSandboxSessionRequest;
 use super::spawn_windows_sandbox_session_elevated_for_permission_profile;
 use super::spawn_windows_sandbox_session_for_level;
@@ -1136,4 +1139,272 @@ fn legacy_tty_cmd_emits_output_and_accepts_input() {
         assert!(stdout.contains("ready"), "stdout={stdout:?}");
         assert!(stdout.contains("second"), "stdout={stdout:?}");
     });
+}
+
+/// Restores `USERPROFILE` when dropped.
+struct UserProfileOverride(Option<std::ffi::OsString>);
+
+impl UserProfileOverride {
+    fn set(profile: &Path) -> Self {
+        let previous = std::env::var_os("USERPROFILE");
+        // SAFETY: this test is `#[ignore]`d and is run on its own with
+        // `--ignored --exact` and one test thread, so no other thread reads the
+        // environment while it changes.
+        unsafe { std::env::set_var("USERPROFILE", profile) };
+        Self(previous)
+    }
+}
+
+impl Drop for UserProfileOverride {
+    fn drop(&mut self) {
+        // SAFETY: see `UserProfileOverride::set`.
+        unsafe {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("USERPROFILE", previous),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+}
+
+/// An approved `:root` write command keeps its retained deny-read paths and
+/// runs as the separate sandbox account. The profile is a fixture on the
+/// system drive (`USERPROFILE` is pointed at it), so the runner's real profile
+/// is never re-ACLed. The runner is an elevated administrator: the paths that
+/// differ for a standard user (who cannot `WRITE_DAC` folders it does not own)
+/// are not exercised here.
+#[test]
+#[ignore = "points USERPROFILE at a fixture: run alone with --ignored --exact --test-threads=1 (claudeai-option-d workflow)"]
+fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::FileSystemSpecialPath;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+
+    let _account_guard =
+        WindowsSandboxAccountTestGuard::acquire().expect("lock Windows sandbox test accounts");
+    let _guard = legacy_process_test_guard();
+
+    // The fixture must be on the system drive, with the profile's volume, not
+    // on the checkout drive.
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let fixture_base = PathBuf::from(format!(
+        "{system_drive}\\codex-optd-e2e-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&fixture_base);
+    fs::create_dir_all(&fixture_base).expect("create fixture base");
+    let fixture_base = dunce::canonicalize(&fixture_base).expect("canonical fixture base");
+    let profile = fixture_base.join("profile");
+    let not_expanded = fixture_base.join("not-expanded");
+    for dir in [
+        profile.join("work"),
+        profile.join(r"data\out"),
+        profile.join("denied"),
+        profile.join(".claude"),
+        profile.join("Documents"),
+        profile.join("bin"),
+        not_expanded.clone(),
+    ] {
+        fs::create_dir_all(&dir).expect("create fixture dir");
+    }
+    fs::write(profile.join(r"data\sibling.txt"), "SIBLING-READABLE").expect("write sibling");
+    fs::write(profile.join(r"data\secret.txt"), "SECRET-MUST-NOT-LEAK").expect("write secret");
+    fs::write(profile.join(r"denied\inner.txt"), "DENIED-DIR-MUST-NOT-LEAK")
+        .expect("write inner");
+    let probe_exe = profile.join(r"bin\probe.exe");
+    fs::copy(std::env::current_exe().expect("test exe"), &probe_exe).expect("copy probe exe");
+    let root_file = PathBuf::from(format!(
+        "{system_drive}\\codex-optd-root-{}.txt",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&root_file);
+
+    let secret = profile.join(r"data\secret.txt");
+    let denied = profile.join("denied");
+    let deny_entry = |path: &Path| {
+        FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(path)
+                .expect("absolute deny path")
+                .into(),
+            FileSystemAccessMode::Deny,
+        )
+    };
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Write,
+            ),
+            deny_entry(&secret),
+            deny_entry(&denied),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    let volume = profile.ancestors().last().expect("volume").to_path_buf();
+    // The overrides `resolve_windows_elevated_filesystem_overrides` produces for
+    // this policy: the volume as the write root, and each denial as both a
+    // deny-read path and a read-only carveout.
+    let write_roots_override = vec![volume];
+    let deny_paths = vec![secret.clone(), denied.clone()];
+
+    let victim = isolation_probe::spawn_victim().expect("spawn medium-integrity victim");
+    let cwd = profile.join("work");
+    let mut env_map = HashMap::from([
+        ("P".to_string(), profile.to_string_lossy().into_owned()),
+        (
+            "NOT_EXPANDED".to_string(),
+            not_expanded.to_string_lossy().into_owned(),
+        ),
+        (
+            "ROOT_FILE".to_string(),
+            root_file.to_string_lossy().into_owned(),
+        ),
+        (
+            isolation_probe::PROBE_PID_ENV.to_string(),
+            victim.pid.to_string(),
+        ),
+    ]);
+    if let Ok(system_root) = std::env::var("SystemRoot") {
+        env_map.insert("SystemRoot".to_string(), system_root);
+    }
+    let script = [
+        r#"(echo OUT>"%P%\data\out\w.txt")"#,
+        r#"(type "%P%\data\sibling.txt")"#,
+        r#"(type "%P%\data\secret.txt")"#,
+        r#"(echo X>>"%P%\data\secret.txt")"#,
+        r#"(type "%P%\denied\inner.txt")"#,
+        r#"(echo X>"%P%\denied\new.txt")"#,
+        r#"(echo X>"%P%\.claude\new.txt")"#,
+        r#"(echo X>"%P%\Documents\PowerShell\profile.ps1")"#,
+        r#"(echo X>"%NOT_EXPANDED%\new.txt")"#,
+        r#"(echo X>"%ROOT_FILE%")"#,
+    ]
+    .join(" & ");
+    let script = format!(
+        r#"{script} & ("%P%\bin\probe.exe" --exact {} --nocapture --test-threads=1) & exit /b 0"#,
+        isolation_probe::PROBE_TEST_NAME
+    );
+
+    let runtime = current_thread_runtime();
+    let codex_home = sandbox_home("elevated-root-write");
+    let stdout = {
+        let _profile_override = UserProfileOverride::set(&profile);
+        runtime.block_on(async {
+            let spawned = spawn_windows_sandbox_session_elevated_for_permission_profile(
+                &permission_profile,
+                &[],
+                codex_home.path(),
+                vec![
+                    "C:\\Windows\\System32\\cmd.exe".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    script,
+                ],
+                cwd.as_path(),
+                env_map,
+                /*proxy_enforced*/ false,
+                /*network_proxy_restricting_sid*/ None,
+                Some(120_000),
+                /*read_roots_override*/ None,
+                /*read_roots_include_platform_defaults*/ false,
+                Some(write_roots_override.as_slice()),
+                &deny_paths,
+                &deny_paths,
+                /*tty*/ false,
+                /*stdin_open*/ false,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "spawn elevated root-write session: {err:#}\nsandbox log:\n{}",
+                    sandbox_log(codex_home.path())
+                )
+            });
+            let (stdout, exit_code) =
+                collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(150))
+                    .await;
+            let stdout = String::from_utf8_lossy(&stdout).into_owned();
+            assert_eq!(
+                exit_code,
+                0,
+                "stdout={stdout}\nsandbox log:\n{}",
+                sandbox_log(codex_home.path())
+            );
+            stdout
+        })
+    };
+    println!("sandbox stdout:\n{stdout}");
+    let log = sandbox_log(codex_home.path());
+
+    // Writes inside an expanded profile directory succeed; reads of undenied
+    // siblings succeed.
+    assert_eq!(
+        fs::read_to_string(profile.join(r"data\out\w.txt"))
+            .unwrap_or_else(|err| panic!("expanded write failed: {err}\nstdout={stdout}\n{log}"))
+            .trim(),
+        "OUT"
+    );
+    assert!(stdout.contains("SIBLING-READABLE"), "stdout={stdout}");
+    // Denied paths stay unreadable and unwritable.
+    assert!(!stdout.contains("SECRET-MUST-NOT-LEAK"), "stdout={stdout}");
+    assert!(!stdout.contains("DENIED-DIR-MUST-NOT-LEAK"), "stdout={stdout}");
+    assert_eq!(
+        fs::read_to_string(&secret).expect("read secret"),
+        "SECRET-MUST-NOT-LEAK"
+    );
+    assert!(
+        !denied.join("new.txt").exists(),
+        "write into a denied directory"
+    );
+    // Agent configuration, deferred-execution folders, folders outside the
+    // profile and the volume root itself are not writable.
+    assert!(
+        !profile.join(r".claude\new.txt").exists(),
+        "write into .claude"
+    );
+    assert!(
+        !profile.join(r"Documents\PowerShell\profile.ps1").exists(),
+        "write into the PowerShell profile folder"
+    );
+    assert!(
+        !not_expanded.join("new.txt").exists(),
+        "write outside the profile"
+    );
+    assert!(!root_file.exists(), "write to the volume root");
+
+    // Process isolation: the sandbox must not obtain any right on a
+    // standard-user process that lets it tamper with, read or stop it.
+    assert!(
+        stdout.contains("PROBE done"),
+        "probe did not run: stdout={stdout}"
+    );
+    let rights = isolation_probe::parse_open_results(&stdout);
+    let granted: Vec<&String> = rights
+        .iter()
+        .filter(|(name, granted)| {
+            **granted
+                && !matches!(
+                    name.as_str(),
+                    "query_limited" | "read_control" | "token_query"
+                )
+        })
+        .map(|(name, _)| name)
+        .collect();
+    let shares_logon_sid = stdout.contains(&format!("PROBE group sid={} ", victim.logon_sid));
+    println!(
+        "PROBE summary shares_logon_sid={shares_logon_sid} victim_logon_sid={} granted={granted:?}",
+        victim.logon_sid
+    );
+    assert!(victim.is_running(), "victim was stopped");
+    assert!(
+        granted.is_empty(),
+        "sandbox obtained {granted:?} on a standard-user process (shares logon SID: {shares_logon_sid})\nstdout={stdout}"
+    );
+    drop(victim);
+    let _ = fs::remove_dir_all(&fixture_base);
 }

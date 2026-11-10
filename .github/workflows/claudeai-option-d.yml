@@ -72,10 +72,17 @@ jobs:
         shell: pwsh
         run: |
           $name = 'unified_exec::tests::elevated_root_write_keeps_denied_reads_and_process_isolation'
-          $out = cargo test -p codex-windows-sandbox --lib $name -- --exact --nocapture 2>&1
+          # The test points USERPROFILE at a fixture, so it is #[ignore]d and runs alone.
+          $out = cargo test -p codex-windows-sandbox --lib $name -- --ignored --exact --nocapture --test-threads=1 2>&1
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Output $_ }
-          $out | Select-String -Pattern '^test |panicked|PROBE|test result' | Select-Object -First 20 | ForEach-Object { Write-Output "::notice title=e2e::$($_.Line)" }
+          # Annotations are capped per step, so join the probe lines into a few.
+          $lines = @($out | ForEach-Object { "$_" })
+          foreach ($pattern in @('PROBE (summary|token)', 'PROBE open', 'PROBE (group|restricted)')) {
+            $joined = (@($lines | Where-Object { $_ -match $pattern }) | ForEach-Object { $_.Trim() }) -join ' | '
+            if ($joined) { Write-Output "::notice title=e2e-probe::$joined" }
+          }
+          $out | Select-String -Pattern '^test |panicked|test result|write ACE|failed' | Select-Object -First 6 | ForEach-Object { Write-Output "::notice title=e2e::$($_.Line)" }
           if ($code -ne 0) { exit $code }
           if (-not ($out -match 'test result: ok\. 1 passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
       - name: Existing elevated test (must still pass)

@@ -25,6 +25,7 @@ use crate::local_user_flags;
 use crate::log_note;
 use crate::log_writer;
 use crate::open_directory_no_reparse;
+use crate::path_normalization::canonical_path_key;
 use crate::path_mask_allows;
 use crate::path_write_aces_need_refresh;
 use crate::resolve_sid;
@@ -92,6 +93,8 @@ use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Threading::INFINITE;
 
 const DENY_ACCESS: i32 = 3;
+/// Most write-root grants propagated at once during a setup refresh.
+const MAX_PARALLEL_WRITE_GRANTS: usize = 8;
 #[cfg(test)]
 const WRITE_ROOT_ALLOW_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
@@ -134,6 +137,10 @@ struct Payload {
     runtime: SetupRuntime,
     #[serde(default)]
     refresh_only: bool,
+    /// Write roots added by a filesystem-root expansion; a failed grant on one
+    /// is logged and skipped instead of failing the refresh.
+    #[serde(default)]
+    best_effort_write_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -1085,53 +1092,91 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         }
     }
 
-    let (tx, rx) = mpsc::channel::<(PathBuf, Result<bool>)>();
-    std::thread::scope(|scope| {
-        for (root, root_cap_sid_str) in grant_tasks {
-            let sid_strings = vec![sandbox_group_sid_str.clone(), root_cap_sid_str];
-            let tx = tx.clone();
-            scope.spawn(move || {
-                // Convert SID strings to psids locally in this thread.
-                let mut psids: Vec<*mut c_void> = Vec::new();
-                for sid_str in &sid_strings {
-                    if let Some(psid) = unsafe { convert_string_sid_to_sid(sid_str) } {
-                        psids.push(psid);
-                    } else {
-                        let _ = tx.send((root.clone(), Err(anyhow::anyhow!("convert SID failed"))));
-                        return;
+    let best_effort_keys: HashSet<String> = payload
+        .best_effort_write_roots
+        .iter()
+        .map(|root| canonical_path_key(root))
+        .collect();
+    let grant_total = grant_tasks.len();
+    let grant_started = std::time::Instant::now();
+    let mut grant_done = 0usize;
+    // Each grant propagates an inheritable ACE through the whole tree under the
+    // root, so cap the threads: a filesystem-root expansion can hand over every
+    // profile directory at once.
+    for batch in grant_tasks.chunks(MAX_PARALLEL_WRITE_GRANTS) {
+        let (tx, rx) = mpsc::channel::<(PathBuf, Result<bool>)>();
+        std::thread::scope(|scope| {
+            for (root, root_cap_sid_str) in batch {
+                let sid_strings = vec![sandbox_group_sid_str.clone(), root_cap_sid_str.clone()];
+                let root = root.clone();
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    // Convert SID strings to psids locally in this thread.
+                    let mut psids: Vec<*mut c_void> = Vec::new();
+                    for sid_str in &sid_strings {
+                        if let Some(psid) = unsafe { convert_string_sid_to_sid(sid_str) } {
+                            psids.push(psid);
+                        } else {
+                            let _ =
+                                tx.send((root.clone(), Err(anyhow::anyhow!("convert SID failed"))));
+                            return;
+                        }
                     }
-                }
 
-                let res = unsafe { ensure_allow_write_aces(&root, &psids) };
+                    let res = unsafe { ensure_allow_write_aces(&root, &psids) };
 
-                for psid in psids {
-                    unsafe {
-                        LocalFree(psid as HLOCAL);
+                    for psid in psids {
+                        unsafe {
+                            LocalFree(psid as HLOCAL);
+                        }
                     }
-                }
-                let _ = tx.send((root, res));
-            });
-        }
-        drop(tx);
-        for (root, res) in rx {
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    if record_acl_failure(
-                        &mut refresh_errors,
-                        WriteAclOperation::Grant,
-                        &root,
-                        &e,
-                        |message| log_line(log, message),
-                    )
-                    .is_err()
-                    {
-                        // ignore log errors inside scoped thread
+                    let _ = tx.send((root, res));
+                });
+            }
+            drop(tx);
+            for (root, res) in rx {
+                grant_done += 1;
+                match res {
+                    Ok(_) => {
+                        if grant_total > MAX_PARALLEL_WRITE_GRANTS {
+                            let _ = log_line(
+                                log,
+                                &format!(
+                                    "write ACE {grant_done}/{grant_total} done for {} after {:?}",
+                                    root.display(),
+                                    grant_started.elapsed()
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) if best_effort_keys.contains(&canonical_path_key(&root)) => {
+                        // An expanded root whose grant failed stays unwritable:
+                        // its capability SID matches no ACE on it.
+                        let _ = log_line(
+                            log,
+                            &format!(
+                                "write ACE grant failed on expanded root {}; leaving it unwritable: {e:#}",
+                                root.display()
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        if record_acl_failure(
+                            &mut refresh_errors,
+                            WriteAclOperation::Grant,
+                            &root,
+                            &e,
+                            |message| log_line(log, message),
+                        )
+                        .is_err()
+                        {
+                            // ignore log errors inside scoped thread
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     for path in &payload.deny_write_paths {
         if !seen_deny_paths.insert(path.clone()) {
@@ -1147,17 +1192,27 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         // bypass the carveout. Materialize missing carveouts as directories so the deny-write ACL
         // is present before the command starts. Legacy protected children are filtered before
         // payload creation, so this should not create sentinel directories in a workspace.
-        if !path.exists() {
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("failed to create deny-write path {}", path.display()))?;
+        // With a filesystem-root expansion the policy carries every deny path
+        // as a carveout of the volume root. One that no expanded root covers
+        // needs no deny ACE and must not create a stray directory.
+        if !payload.best_effort_write_roots.is_empty()
+            && !payload
+                .write_roots
+                .iter()
+                .any(|root| workspace_write_root_overlaps_path(root, path))
+        {
+            continue;
         }
-
         let deny_sid_strs = workspace_write_cap_sids_for_path(
             &payload.codex_home,
             &payload.command_cwd,
             &payload.write_roots,
             path,
         )?;
+        if !path.exists() {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("failed to create deny-write path {}", path.display()))?;
+        }
         for deny_sid_str in deny_sid_strs {
             let deny_psid = unsafe {
                 convert_string_sid_to_sid(&deny_sid_str)

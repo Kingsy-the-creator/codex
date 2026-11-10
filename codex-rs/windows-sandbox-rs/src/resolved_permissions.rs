@@ -116,6 +116,20 @@ impl ResolvedWindowsSandboxPermissions {
         Ok(())
     }
 
+    /// Returns a predicate answering whether the policy denies reading a local
+    /// path (including paths under a read-denied directory or matching a deny
+    /// glob). It fails closed: a policy whose deny entries cannot be prepared
+    /// denies every path.
+    pub(crate) fn local_read_deny_predicate(&self, cwd: &Path) -> Box<dyn Fn(&Path) -> bool> {
+        match ReadDenyMatcher::try_new_for_local_paths(&self.file_system, cwd) {
+            Ok(None) => Box::new(|_: &Path| false),
+            Ok(Some(matcher)) => {
+                Box::new(move |path: &Path| matcher.is_local_path_read_denied(path))
+            }
+            Err(_) => Box::new(|_: &Path| true),
+        }
+    }
+
     pub(crate) fn has_full_disk_read_access(&self) -> bool {
         self.file_system.has_full_disk_read_access()
     }

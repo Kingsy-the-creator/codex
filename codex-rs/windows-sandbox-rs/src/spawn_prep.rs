@@ -21,6 +21,7 @@ use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_codex_home_exists;
 use crate::sandbox_utils::inject_git_safe_directory;
+use crate::setup::effective_legacy_write_roots_for_permissions;
 use crate::setup::effective_write_roots_for_permissions;
 use crate::token::LocalSid;
 use crate::token::create_readonly_token_with_cap;
@@ -192,7 +193,8 @@ pub(crate) fn legacy_session_capability_roots(
         .into_iter()
         .collect::<Vec<_>>();
     if permissions.uses_write_capabilities_for_cwd(current_dir, env_map) {
-        effective_write_roots_for_permissions(
+        // The unelevated backend never expands a filesystem-root write root.
+        effective_legacy_write_roots_for_permissions(
             permissions,
             current_dir,
             env_map,
