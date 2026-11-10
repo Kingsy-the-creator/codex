@@ -1820,10 +1820,14 @@ mod tests {
             "{default_roots:?}"
         );
         let volume = workspace.ancestors().last().expect("volume").to_path_buf();
+        // CI TEMP may be on D: while USERPROFILE is on C:. Exercise expansion
+        // on the profile's volume rather than accidentally testing an empty set.
+        let profile_dir = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE"));
+        let profile_volume = profile_dir.ancestors().last().expect("profile volume").to_path_buf();
         let payload = super::setup_refresh_payload(
             &request,
             super::SetupRootOverrides {
-                write_roots: Some(vec![volume.clone()]),
+                write_roots: Some(vec![profile_volume]),
                 deny_read_paths: Some(vec![private.clone()]),
                 ..super::SetupRootOverrides::default()
             },
