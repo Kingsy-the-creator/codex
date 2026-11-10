@@ -43,9 +43,6 @@ const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
 const LUA_TOKEN: u32 = 0x04;
 const WRITE_RESTRICTED: u32 = 0x08;
 const GENERIC_ALL: u32 = 0x1000_0000;
-const GENERIC_EXECUTE: u32 = 0x2000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const GENERIC_READ: u32 = 0x8000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const SE_GROUP_LOGON_ID: u32 = 0xC0000000;
 
@@ -79,10 +76,12 @@ unsafe fn set_default_dacl(
         ),
     ];
     if let Some(group) = own_objects_group {
-        // No WRITE_DAC, WRITE_OWNER or DELETE: those are not part of an
-        // object's generic write mapping, so a write-restricted token of
-        // another logon would not be stopped by its restricting SIDs.
-        grants.push((group, GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE));
+        // GENERIC_ALL: console hosts and runtimes open their own process and
+        // threads with *_ALL_ACCESS (CI run 42911734286 hung every command
+        // without it). Write-type rights still need the logon SID in the
+        // restricting check; `isolated_default_objects_keep_write_access_within_the_logon`
+        // checks that WRITE_DAC is among them for another logon.
+        grants.push((group, GENERIC_ALL));
     }
     let entries: Vec<EXPLICIT_ACCESS_W> = grants
         .into_iter()
@@ -499,11 +498,10 @@ unsafe fn create_token_with_caps_user_and_additional_restrictions_from(
 /// restricting SID, so the command keeps write-type access only where both the
 /// logon SID and its own groups allow it.
 ///
-/// The token's own objects are granted generic read, write and execute for
-/// `CodexSandboxUsers`, which must be an enabled group of `base_token`. Another
-/// logon of the sandbox account can therefore read, query and terminate this
-/// command's processes, but cannot write to them, inject into them or change
-/// their DACL. The command itself cannot change the DACL of its own objects.
+/// The token's own objects are also granted to `CodexSandboxUsers`, which must
+/// be an enabled group of `base_token`. Another logon of the sandbox account
+/// can therefore read, query and terminate this command's processes, but
+/// cannot write to them, inject into them or change their DACL.
 ///
 /// # Safety
 /// Caller must close the returned token handle; base_token must be a valid primary token.
