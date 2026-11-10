@@ -1851,7 +1851,7 @@ mod tests {
             "fixture needs profile write roots"
         );
         assert_eq!(payload.best_effort_write_roots, payload.write_roots);
-        assert_eq!(payload.deny_read_paths, vec![private.clone()]);
+        assert_eq!(payload.deny_read_paths, vec![private]);
         let user_profile = payload.user_profile.as_deref().expect("profile");
         for path in super::deferred_execution_paths(user_profile) {
             assert!(

@@ -57,12 +57,15 @@ fn elevated_non_write_temp_never_grants_write_access() {
     }
 }
 
-fn root_write_with_denied(root_entry: FileSystemPath, denied: &Path) -> PermissionProfile {
+fn root_write_with_denied(
+    root_entry: FileSystemPath,
+    denied: AbsolutePathBuf,
+) -> PermissionProfile {
     PermissionProfile::from_runtime_permissions(
         &FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry::new(root_entry, FileSystemAccessMode::Write),
             FileSystemSandboxEntry::new(
-                AbsolutePathBuf::from_absolute_path(denied).unwrap().into(),
+                denied.into(),
                 FileSystemAccessMode::Deny,
             ),
         ]),
@@ -84,7 +87,7 @@ fn elevated_symbolic_root_write_with_retained_denied_read_reaches_setup() {
         FileSystemPath::Special {
             value: FileSystemSpecialPath::Root,
         },
-        &private,
+        AbsolutePathBuf::from_absolute_path(&private).unwrap(),
     );
     let overrides = resolve_windows_elevated_filesystem_overrides(
         SandboxType::WindowsRestrictedToken,
@@ -123,7 +126,7 @@ fn elevated_explicit_filesystem_root_write_is_still_refused_before_setup() {
     let volume = cwd.as_path().ancestors().last().unwrap().to_path_buf();
     let explicit = root_write_with_denied(
         AbsolutePathBuf::from_absolute_path(&volume).unwrap().into(),
-        &private,
+        AbsolutePathBuf::from_absolute_path(&private).unwrap(),
     );
     let err = resolve_windows_elevated_filesystem_overrides(
         SandboxType::WindowsRestrictedToken,
@@ -150,7 +153,7 @@ fn unelevated_symbolic_root_write_with_retained_denied_read_is_refused() {
         FileSystemPath::Special {
             value: FileSystemSpecialPath::Root,
         },
-        &private,
+        AbsolutePathBuf::from_absolute_path(&private).unwrap(),
     );
     let err = resolve_windows_restricted_token_filesystem_overrides(
         SandboxType::WindowsRestrictedToken,
