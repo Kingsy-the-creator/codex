@@ -351,15 +351,29 @@ fn run_setup_refresh_inner(
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
     runtime: SetupRuntime,
 ) -> Result<()> {
+    let payload = setup_refresh_payload(&request, overrides, offline_proxy_settings_override, runtime)?;
+    let json = serde_json::to_vec(&payload)?;
+    let b64 = BASE64_STANDARD.encode(json);
+    run_setup_singleflight(b64.clone(), || {
+        run_setup_refresh_payload(&b64, request.codex_home)
+    })
+}
+
+fn setup_refresh_payload(
+    request: &SandboxSetupRequest<'_>,
+    overrides: SetupRootOverrides,
+    offline_proxy_settings_override: Option<&OfflineProxySettings>,
+    runtime: SetupRuntime,
+) -> Result<ElevationPayload> {
     request
         .permissions
         .validate_elevated_filesystem_policy(request.command_cwd)?;
-    let (read_roots, write_roots) = build_payload_roots(&request, &overrides, runtime);
+    let (read_roots, write_roots) = build_payload_roots(request, &overrides, runtime);
     // Validate the roots that would actually receive capability ACEs, after
     // explicit overrides. A profile-level check also rejects read-only refreshes.
     validate_refresh_write_roots(&write_roots)?;
     let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
-    let mut deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let mut deny_write_paths = build_payload_deny_write_paths(request, overrides.deny_write_paths);
     let requested_write_roots = requested_write_roots_for_permissions(
         request.permissions,
         request.command_cwd,
@@ -376,7 +390,7 @@ fn run_setup_refresh_inner(
         deny_write_paths.extend(deferred_execution_paths(Path::new(&user_profile)));
     }
     let offline_proxy_settings =
-        offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
+        offline_proxy_settings_for_request(request, offline_proxy_settings_override);
     let payload = ElevationPayload {
         version: SETUP_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
@@ -399,11 +413,7 @@ fn run_setup_refresh_inner(
         refresh_only: true,
         best_effort_write_roots,
     };
-    let json = serde_json::to_vec(&payload)?;
-    let b64 = BASE64_STANDARD.encode(json);
-    run_setup_singleflight(b64.clone(), || {
-        run_setup_refresh_payload(&b64, request.codex_home)
-    })
+    Ok(payload)
 }
 
 fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
@@ -1810,6 +1820,23 @@ mod tests {
             "{default_roots:?}"
         );
         let volume = workspace.ancestors().last().expect("volume").to_path_buf();
+        let payload = super::setup_refresh_payload(
+            &request,
+            super::SetupRootOverrides {
+                write_roots: Some(vec![volume.clone()]),
+                deny_read_paths: Some(vec![private.clone()]),
+                ..super::SetupRootOverrides::default()
+            },
+            None,
+            super::SetupRuntime::Legacy,
+        ).expect("build root-write refresh payload");
+        assert!(!payload.write_roots.is_empty(), "fixture needs profile write roots");
+        assert_eq!(payload.best_effort_write_roots, payload.write_roots);
+        assert_eq!(payload.deny_read_paths, vec![private.clone()]);
+        let user_profile = payload.user_profile.as_deref().expect("profile");
+        for path in super::deferred_execution_paths(user_profile) {
+            assert!(payload.deny_write_paths.contains(&path), "missing carveout {path:?}");
+        }
         super::validate_refresh_write_roots(&[volume])
             .expect_err("a literal filesystem root is still refused");
 

@@ -396,11 +396,8 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     } else {
         Vec::new()
     };
-    let setup_write_roots_override = if uses_write_capabilities {
-        Some(effective_write_roots.as_slice())
-    } else {
-        write_roots_override
-    };
+    // Setup needs the requested roots to recognise filesystem-root expansion
+    // and retain its best-effort grants and deferred-execution protections.
     let sandbox_creds = require_logon_sandbox_creds(
         &permissions,
         cwd,
@@ -408,7 +405,7 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         codex_home,
         read_roots_override,
         read_roots_include_platform_defaults,
-        setup_write_roots_override,
+        write_roots_for_setup,
         deny_read_paths_override,
         if deny_write_paths_override.is_empty() {
             &deny_write_paths

@@ -210,7 +210,8 @@ fn sid_string(sid: *mut c_void) -> String {
     }
 }
 
-/// Starts `ping -n 120 127.0.0.1` as the victim.
+/// Starts `ping -n 900 127.0.0.1` as the victim. Its token retains the
+/// administrator groups/privileges; token-access results are indicative only.
 pub(super) fn spawn_victim() -> Result<Victim, String> {
     // SAFETY: plain Win32 calls on handles and buffers owned by this function;
     // every allocation is released before returning.
@@ -296,7 +297,7 @@ pub(super) fn spawn_victim() -> Result<Victim, String> {
         let mut startup: StartupInfoW = std::mem::zeroed();
         startup.cb = std::mem::size_of::<StartupInfoW>() as u32;
         let mut info: ProcessInformation = std::mem::zeroed();
-        let mut command_line = to_wide(r"C:\Windows\System32\PING.EXE -n 120 127.0.0.1");
+        let mut command_line = to_wide(r"C:\Windows\System32\PING.EXE -n 900 127.0.0.1");
         let created = CreateProcessAsUserW(
             token,
             std::ptr::null(),
@@ -325,22 +326,25 @@ pub(super) fn spawn_victim() -> Result<Victim, String> {
     }
 }
 
-/// Parses `PROBE open name=<n> granted=<0|1> ...` lines into name -> granted.
-pub(super) fn parse_open_results(stdout: &str) -> BTreeMap<String, bool> {
+/// Parses complete results, retaining errors so an expired victim cannot pass.
+pub(super) fn parse_open_results(stdout: &str) -> BTreeMap<String, (bool, u32)> {
     stdout
         .lines()
         .filter_map(|line| line.trim().strip_prefix("PROBE open "))
         .filter_map(|rest| {
             let mut name = None;
             let mut granted = None;
+            let mut error = None;
             for field in rest.split_whitespace() {
                 if let Some(value) = field.strip_prefix("name=") {
                     name = Some(value.to_string());
                 } else if let Some(value) = field.strip_prefix("granted=") {
-                    granted = Some(value == "1");
+                    granted = match value { "0" => Some(false), "1" => Some(true), _ => None };
+                } else if let Some(value) = field.strip_prefix("error=") {
+                    error = value.parse::<u32>().ok();
                 }
             }
-            Some((name?, granted?))
+            Some((name?, (granted?, error?)))
         })
         .collect()
 }

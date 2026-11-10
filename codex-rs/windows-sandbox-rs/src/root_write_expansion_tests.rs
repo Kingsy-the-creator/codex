@@ -67,7 +67,7 @@ fn non_root_write_roots_pass_through_unchanged() {
 
 #[test]
 fn filesystem_root_becomes_real_profile_directories_only() {
-    let fake = FakeProfile::new(&["Documents", "AppData", "dev"]);
+    let fake = FakeProfile::new(&[r"Documents\notes", r"AppData\cache", "dev"]);
     std::fs::write(fake.profile.join(".gitconfig"), "x").expect("write profile file");
     let junction = fake.profile.join("linked");
     let junction_made = std::process::Command::new("cmd")
@@ -87,9 +87,9 @@ fn filesystem_root_becomes_real_profile_directories_only() {
     assert_eq!(
         keys(&expanded),
         keys(&[
-            fake.profile.join("AppData"),
+            fake.profile.join(r"AppData\cache"),
             fake.profile.join("dev"),
-            fake.profile.join("Documents"),
+            fake.profile.join(r"Documents\notes"),
         ])
     );
 }
@@ -125,7 +125,7 @@ fn missing_profile_expands_to_nothing() {
 
 #[test]
 fn read_denied_children_and_children_under_denied_paths_are_dropped() {
-    let fake = FakeProfile::new(&["Documents", "secrets", "vault"]);
+    let fake = FakeProfile::new(&[r"Documents\notes", "secrets", "vault"]);
     let secrets_key = canonical_path_key(&fake.profile.join("secrets"));
     // `vault` lies under a denied glob or directory in the policy.
     let vault_key = canonical_path_key(&fake.profile.join("vault"));
@@ -134,13 +134,13 @@ fn read_denied_children_and_children_under_denied_paths_are_dropped() {
         key == secrets_key || key == vault_key
     };
     let expanded = fake.expand_volume(&is_read_denied);
-    assert_eq!(keys(&expanded), keys(&[fake.profile.join("Documents")]));
+    assert_eq!(keys(&expanded), keys(&[fake.profile.join(r"Documents\notes")]));
 }
 
 #[test]
 fn agent_configuration_folders_are_never_expanded() {
     let fake = FakeProfile::new(&[
-        "Documents",
+        r"Documents\notes",
         ".claude",
         ".Codex",
         ".agents",
@@ -149,7 +149,7 @@ fn agent_configuration_folders_are_never_expanded() {
         ".gemini",
     ]);
     let expanded = fake.expand_volume(&never_denied);
-    assert_eq!(keys(&expanded), keys(&[fake.profile.join("Documents")]));
+    assert_eq!(keys(&expanded), keys(&[fake.profile.join(r"Documents\notes")]));
 }
 
 #[test]
@@ -201,4 +201,71 @@ fn deferred_execution_paths_need_an_existing_parent() {
         let key = canonical_path_key(&fake.profile.join(absent));
         assert!(!paths.contains(&key), "unexpected {absent}: {paths:?}");
     }
+}
+
+
+#[test]
+fn denied_ancestor_is_checked_before_splitting_or_traversing() {
+    let mut fake = FakeProfile::new(&[r"private\home", r"private\sibling", "work"]);
+    fake.codex_home = fake.profile.join(r"private\home");
+    let denied = fake.profile.join("private");
+    let predicate = |path: &Path| {
+        assert!(!path.starts_with(&denied) || path == denied, "traversed denied ancestor");
+        path == denied
+    };
+    assert_eq!(keys(&fake.expand_volume(&predicate)), keys(&[fake.profile.join("work")]));
+}
+
+#[test]
+fn deferred_execution_paths_and_their_ancestors_are_not_write_roots() {
+    let fake = FakeProfile::new(&[
+        r"Documents\PowerShell", r"Documents\WindowsPowerShell", r"Documents\notes",
+        r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
+        r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\safe",
+        r"AppData\Local\Microsoft\WindowsApps", r"AppData\Local\cache",
+        r"OneDrive\Documents\PowerShell", r"OneDrive\Documents\notes",
+    ]);
+    let expanded = fake.expand_volume(&never_denied);
+    assert_eq!(keys(&expanded), keys(&[
+        fake.profile.join(r"Documents\notes"),
+        fake.profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\safe"),
+        fake.profile.join(r"AppData\Local\cache"),
+        fake.profile.join(r"OneDrive\Documents\notes"),
+    ]));
+    for protected in deferred_execution_candidates(&fake.profile) {
+        for root in &expanded {
+            assert!(!protected.starts_with(root) && !root.starts_with(&protected), "{root:?} overlaps {protected:?}");
+        }
+    }
+}
+
+#[test]
+fn missing_deferred_paths_still_protect_existing_ancestors() {
+    let fake = FakeProfile::new(&[r"AppData\Roaming\safe", r"Documents\notes"]);
+    assert_eq!(keys(&fake.expand_volume(&never_denied)), keys(&[
+        fake.profile.join(r"AppData\Roaming\safe"), fake.profile.join(r"Documents\notes"),
+    ]));
+}
+
+#[test]
+fn canonical_alias_denial_excludes_real_root_and_descendants() {
+    use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::{FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy, NetworkSandboxPolicy};
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    let fake = FakeProfile::new(&[r"private\child", "work"]);
+    let alias = fake.profile.join("alias");
+    let output = std::process::Command::new("cmd").args(["/D", "/C", "mklink", "/J"])
+        .arg(&alias).arg(fake.profile.join("private")).output().expect("mklink");
+    assert!(output.status.success(), "{output:?}");
+    let profile = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(&alias).expect("absolute alias").into(), FileSystemAccessMode::Deny,
+        )]), NetworkSandboxPolicy::Restricted,
+    );
+    let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).expect("permissions");
+    let predicate = permissions.local_read_deny_predicate(&fake.profile);
+    assert!(predicate(&fake.profile.join("private")));
+    assert!(predicate(&fake.profile.join(r"private\child")));
+    assert_eq!(keys(&fake.expand_volume(predicate.as_ref())), keys(&[fake.profile.join("work")]));
 }

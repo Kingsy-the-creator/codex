@@ -121,11 +121,26 @@ impl ResolvedWindowsSandboxPermissions {
     /// glob). It fails closed: a policy whose deny entries cannot be prepared
     /// denies every path.
     pub(crate) fn local_read_deny_predicate(&self, cwd: &Path) -> Box<dyn Fn(&Path) -> bool> {
+        // Use the same resolved and canonical targets as deny-read ACL setup,
+        // so an alias denial also excludes its real target from write grants.
+        let planned = AbsolutePathBuf::from_absolute_path(cwd)
+            .map_err(|err| err.to_string())
+            .and_then(|cwd| crate::deny_read_resolver::resolve_windows_deny_read_paths(&self.file_system, &cwd))
+            .and_then(|paths| {
+                let paths: Vec<PathBuf> = paths.into_iter().map(AbsolutePathBuf::into_path_buf).collect();
+                crate::deny_read_acl::plan_deny_read_acl_paths(&paths).map_err(|err| err.to_string())
+            });
+        let Ok(planned) = planned else {
+            return Box::new(|_: &Path| true);
+        };
+        let denied_keys: Vec<String> = planned.iter()
+            .map(|path| crate::path_normalization::canonical_path_key(path)).collect();
         match ReadDenyMatcher::try_new_for_local_paths(&self.file_system, cwd) {
-            Ok(None) => Box::new(|_: &Path| false),
-            Ok(Some(matcher)) => {
-                Box::new(move |path: &Path| matcher.is_local_path_read_denied(path))
-            }
+            Ok(matcher) => Box::new(move |path: &Path| {
+                let key = crate::path_normalization::canonical_path_key(path);
+                matcher.as_ref().is_some_and(|matcher| matcher.is_local_path_read_denied(path))
+                    || denied_keys.iter().any(|denied| Path::new(&key).starts_with(denied))
+            }),
             Err(_) => Box::new(|_: &Path| true),
         }
     }

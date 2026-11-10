@@ -21,9 +21,9 @@
 //!   a root would make the denied path readable. A read-denied path strictly
 //!   inside a root keeps its own explicit deny ACE, which precedes the
 //!   inherited allow, so the root is kept;
-//! - is `CODEX_HOME` or contains it. A root containing `CODEX_HOME` is split
-//!   into its real child directories, recursively, so `CODEX_HOME` itself never
-//!   inherits a write grant.
+//! - is `CODEX_HOME`, a deferred-execution directory, or an ancestor of either.
+//!   Ancestors are split into real child directories recursively, so neither
+//!   the protected directory nor an ancestor receives a write grant.
 //!
 //! Nothing else is added, and the filesystem root itself never is. Writes the
 //! user could otherwise make elsewhere (other volumes, `C:\` itself, folders
@@ -49,8 +49,8 @@ pub(crate) const ROOT_WRITE_PROFILE_EXCLUSIONS: &[&str] = &[
 ];
 
 /// Profile-relative folders whose contents Windows or the user's shell runs
-/// automatically later. When an expanded root contains one, it is protected
-/// with a deny-write carveout.
+/// automatically later. Expansion splits around these even when missing;
+/// existing parents also permit materialising a deny-write carveout.
 const DEFERRED_EXECUTION_PROFILE_PATHS: &[&str] = &[
     r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
     r"AppData\Local\Microsoft\WindowsApps",
@@ -60,7 +60,7 @@ const DEFERRED_EXECUTION_PROFILE_PATHS: &[&str] = &[
     r"OneDrive\Documents\WindowsPowerShell",
 ];
 
-/// How deep a root containing `CODEX_HOME` is split before it is dropped.
+/// How deep a root containing a protected path is split before it is dropped.
 const MAX_SPLIT_DEPTH: usize = 8;
 
 /// True when `path` is a filesystem root (a drive root such as `C:\`, a UNC
@@ -90,7 +90,6 @@ pub(crate) fn expand_filesystem_root_write_roots(
     if !roots.iter().any(|root| is_filesystem_root(root)) {
         return roots;
     }
-    let codex_home_key = canonical_path_key(expansion.codex_home);
     let mut expanded = Vec::new();
     for root in roots {
         if !is_filesystem_root(&root) {
@@ -104,11 +103,16 @@ pub(crate) fn expand_filesystem_root_write_roots(
             continue;
         };
         let mut from_profile = Vec::new();
+        let mut protected_keys: Vec<String> = deferred_execution_candidates(profile)
+            .iter()
+            .map(|path| canonical_path_key(path))
+            .collect();
+        protected_keys.push(canonical_path_key(expansion.codex_home));
         for child in real_child_dirs(profile) {
             if is_root_write_profile_exclusion(&child) {
                 continue;
             }
-            split_around_codex_home(child, &codex_home_key, 0, &mut from_profile);
+            split_around_protected_paths(child, &protected_keys, expansion.is_read_denied, 0, &mut from_profile);
         }
         // Only the roots this expansion adds are filtered here; explicit write
         // roots keep the policy's own precedence rules.
@@ -121,10 +125,22 @@ pub(crate) fn expand_filesystem_root_write_roots(
 }
 
 /// The deny-write carveouts an expanded profile needs: the folders under the
-/// profile (and the user's Documents and Startup folders, wherever they are)
+/// profile (including redirected Documents and Startup folders within it)
 /// whose contents run automatically later. Only paths whose parent exists are
 /// returned, so a carveout never creates a stray folder tree.
 pub(crate) fn deferred_execution_paths(user_profile: &Path) -> Vec<PathBuf> {
+    let mut paths = deferred_execution_candidates(user_profile);
+    let profile_key = canonical_path_key(user_profile);
+    paths.retain(|path| {
+        Path::new(&canonical_path_key(path)).starts_with(&profile_key)
+            && path.parent().is_some_and(Path::is_dir)
+    });
+    paths.sort_by_key(|path| canonical_path_key(path));
+    paths.dedup_by(|a, b| canonical_path_key(a) == canonical_path_key(b));
+    paths
+}
+
+fn deferred_execution_candidates(user_profile: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = DEFERRED_EXECUTION_PROFILE_PATHS
         .iter()
         .map(|relative| user_profile.join(relative))
@@ -136,9 +152,6 @@ pub(crate) fn deferred_execution_paths(user_profile: &Path) -> Vec<PathBuf> {
     if let Some(startup) = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Startup) {
         paths.push(startup);
     }
-    paths.retain(|path| path.parent().is_some_and(Path::is_dir));
-    paths.sort_by_key(|path| canonical_path_key(path));
-    paths.dedup_by(|a, b| canonical_path_key(a) == canonical_path_key(b));
     paths
 }
 
@@ -161,20 +174,25 @@ fn is_root_write_profile_exclusion(path: &Path) -> bool {
     })
 }
 
-/// Pushes `root` unless it is or contains `CODEX_HOME`; a root that contains
-/// it is replaced by its real child directories, recursively.
-fn split_around_codex_home(
+/// Pushes `root` unless it overlaps a protected path; ancestors are replaced
+/// by their real child directories, recursively, without traversing denials.
+fn split_around_protected_paths(
     root: PathBuf,
-    codex_home_key: &str,
+    protected_keys: &[String],
+    is_read_denied: &dyn Fn(&Path) -> bool,
     depth: usize,
     out: &mut Vec<PathBuf>,
 ) {
+    // Check before enumerating descendants, including ancestors of CODEX_HOME.
+    if is_read_denied(&root) {
+        return;
+    }
     let root_key = canonical_path_key(&root);
-    if root_key == codex_home_key {
+    if protected_keys.iter().any(|key| Path::new(&root_key).starts_with(key)) {
         return;
     }
     let root_prefix = format!("{}/", root_key.trim_end_matches('/'));
-    if !codex_home_key.starts_with(&root_prefix) {
+    if !protected_keys.iter().any(|key| key.starts_with(&root_prefix)) {
         out.push(root);
         return;
     }
@@ -182,7 +200,7 @@ fn split_around_codex_home(
         return;
     }
     for child in real_child_dirs(&root) {
-        split_around_codex_home(child, codex_home_key, depth + 1, out);
+        split_around_protected_paths(child, protected_keys, is_read_denied, depth + 1, out);
     }
 }
 

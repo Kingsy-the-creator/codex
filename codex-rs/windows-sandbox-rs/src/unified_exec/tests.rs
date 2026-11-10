@@ -1205,6 +1205,7 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         profile.join("denied"),
         profile.join(".claude"),
         profile.join("Documents"),
+        profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
         profile.join("bin"),
         not_expanded.clone(),
     ] {
@@ -1273,6 +1274,10 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         env_map.insert("SystemRoot".to_string(), system_root);
     }
     let script = [
+        r#"if not exist "%P%\Documents\PowerShell\" exit /b 91"#,
+        r#"if not exist "%P%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\" exit /b 92"#,
+        r#"mkdir "%P%\Documents\PowerShell" 2>nul"#,
+        r#"mkdir "%P%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup" 2>nul"#,
         r#"(echo OUT>"%P%\data\out\w.txt")"#,
         r#"(type "%P%\data\sibling.txt")"#,
         r#"(type "%P%\data\secret.txt")"#,
@@ -1281,14 +1286,20 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         r#"(echo X>"%P%\denied\new.txt")"#,
         r#"(echo X>"%P%\.claude\new.txt")"#,
         r#"(echo X>"%P%\Documents\PowerShell\profile.ps1")"#,
+        r#"(echo X>"%P%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\probe.cmd")"#,
+        r#"ren "%P%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs" Programs-moved"#,
         r#"(echo X>"%NOT_EXPANDED%\new.txt")"#,
         r#"(echo X>"%ROOT_FILE%")"#,
     ]
-    .join(" & ");
+    .join("\r\n");
     let script = format!(
-        r#"{script} & ("%P%\bin\probe.exe" --exact {} --nocapture --test-threads=1) & exit /b 0"#,
+        "@echo off\r\n{script}\r\n\"%P%\\bin\\probe.exe\" --exact {} --nocapture --test-threads=1\r\nexit /b %errorlevel%\r\n",
         isolation_probe::PROBE_TEST_NAME
     );
+    // Keep cmd syntax inside a batch file; Windows argv quoting does not
+    // escape embedded quotes using cmd.exe's rules.
+    let script_path = cwd.join("root-write.cmd");
+    fs::write(&script_path, script).expect("write e2e batch file");
 
     let runtime = current_thread_runtime();
     let codex_home = sandbox_home("elevated-root-write");
@@ -1303,7 +1314,7 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
                     "C:\\Windows\\System32\\cmd.exe".to_string(),
                     "/d".to_string(),
                     "/c".to_string(),
-                    script,
+                    script_path.to_string_lossy().into_owned(),
                 ],
                 cwd.as_path(),
                 env_map,
@@ -1368,9 +1379,17 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         "write into .claude"
     );
     assert!(
+        profile.join(r"Documents\PowerShell").is_dir(),
+        "setup did not materialise the PowerShell carveout"
+    );
+    assert!(
         !profile.join(r"Documents\PowerShell\profile.ps1").exists(),
         "write into the PowerShell profile folder"
     );
+    let programs = profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs");
+    assert!(programs.join("Startup").is_dir(), "setup did not materialise Startup, or its ancestor was renamed");
+    assert!(!programs.join(r"Startup\probe.cmd").exists(), "write into Startup");
+    assert!(!programs.with_file_name("Programs-moved").exists(), "renamed a protected ancestor");
     assert!(
         !not_expanded.join("new.txt").exists(),
         "write outside the profile"
@@ -1386,8 +1405,8 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
     let rights = isolation_probe::parse_open_results(&stdout);
     let granted: Vec<&String> = rights
         .iter()
-        .filter(|(name, granted)| {
-            **granted
+        .filter(|(name, (granted, _))| {
+            *granted
                 && !matches!(
                     name.as_str(),
                     "query_limited" | "read_control" | "token_query"
@@ -1401,6 +1420,13 @@ fn elevated_root_write_keeps_denied_reads_and_process_isolation() {
         victim.logon_sid
     );
     assert!(victim.is_running(), "victim was stopped");
+    for name in isolation_probe::PROBED_RIGHTS.iter().map(|(name, _)| *name)
+        .chain(["token_query", "token_duplicate"])
+    {
+        let (granted, error) = rights.get(name)
+            .unwrap_or_else(|| panic!("missing probe result for {name}: {stdout}"));
+        assert_eq!(*error, if *granted { 0 } else { 5 }, "unexpected error for {name}: {stdout}");
+    }
     assert!(
         granted.is_empty(),
         "sandbox obtained {granted:?} on a standard-user process (shares logon SID: {shares_logon_sid})\nstdout={stdout}"

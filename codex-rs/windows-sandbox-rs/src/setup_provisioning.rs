@@ -1150,12 +1150,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                         }
                     }
                     Err(e) if best_effort_keys.contains(&canonical_path_key(&root)) => {
-                        // An expanded root whose grant failed stays unwritable:
-                        // its capability SID matches no ACE on it.
+                        // Existing or partially propagated ACEs may still permit writes.
                         let _ = log_line(
                             log,
                             &format!(
-                                "write ACE grant failed on expanded root {}; leaving it unwritable: {e:#}",
+                                "write ACE grant failed on expanded root {}; continuing without a confirmed grant: {e:#}",
                                 root.display()
                             ),
                         );
@@ -1178,6 +1177,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         });
     }
 
+    let deferred_paths = payload.user_profile.as_deref()
+        .map(crate::root_write_expansion::deferred_execution_paths)
+        .unwrap_or_default();
     for path in &payload.deny_write_paths {
         if !seen_deny_paths.insert(path.clone()) {
             continue;
@@ -1196,6 +1198,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         // as a carveout of the volume root. One that no expanded root covers
         // needs no deny ACE and must not create a stray directory.
         if !payload.best_effort_write_roots.is_empty()
+            && !deferred_paths.iter().any(|deferred| canonical_path_key(deferred) == canonical_path_key(path))
             && !payload
                 .write_roots
                 .iter()
