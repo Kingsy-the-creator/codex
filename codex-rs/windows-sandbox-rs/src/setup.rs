@@ -373,7 +373,11 @@ fn setup_refresh_payload(
 ) -> Result<ElevationPayload> {
     request
         .permissions
-        .validate_elevated_filesystem_policy(request.command_cwd)?;
+        .validate_elevated_write_roots(
+            request.command_cwd,
+            request.env_map,
+            overrides.write_roots.as_deref(),
+        )?;
     let (read_roots, write_roots) = build_payload_roots(request, &overrides, runtime);
     // Validate the roots that would actually receive capability ACEs, after
     // explicit overrides. A profile-level check also rejects read-only refreshes.
@@ -1855,8 +1859,15 @@ mod tests {
             .last()
             .expect("profile volume")
             .to_path_buf();
+        let profile_request = super::SandboxSetupRequest {
+            command_cwd: &profile_dir,
+            permissions: request.permissions,
+            env_map: request.env_map,
+            codex_home: request.codex_home,
+            proxy_enforced: request.proxy_enforced,
+        };
         let payload = super::setup_refresh_payload(
-            &request,
+            &profile_request,
             super::SetupRootOverrides {
                 write_roots: Some(vec![profile_volume]),
                 deny_read_paths: Some(vec![private.clone()]),
@@ -2148,6 +2159,42 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    #[test]
+    fn setup_refresh_rejects_unsafe_root_write_policies_before_setup() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path();
+        let volume = cwd.ancestors().last().expect("volume");
+        let codex_home = cwd.join("must-not-be-created");
+        let explicit = FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(volume).expect("volume").into(),
+            FileSystemAccessMode::Write,
+        );
+        let symbolic = FileSystemSandboxEntry::new(
+            FileSystemPath::Special { value: FileSystemSpecialPath::Root },
+            FileSystemAccessMode::Write,
+        );
+        let glob = FileSystemSandboxEntry::new(
+            FileSystemPath::GlobPattern { pattern: cwd.join("future").join("*.env").display().to_string() },
+            FileSystemAccessMode::Deny,
+        );
+        for (entries, expected) in [
+            (vec![explicit], "explicit filesystem-root writes"),
+            (vec![symbolic, glob], "deny-read globs"),
+        ] {
+            let profile = PermissionProfile::Managed {
+                file_system: ManagedFileSystemPermissions::Restricted { entries, glob_scan_max_depth: None },
+                network: NetworkSandboxPolicy::Restricted,
+            };
+            for result in [
+                super::run_setup_refresh(&profile, &[], cwd, &HashMap::new(), &codex_home, false),
+                super::run_setup_refresh_with_extra_read_roots(&profile, &[], cwd, &HashMap::new(), &codex_home, Vec::new(), false),
+            ] {
+                assert!(result.expect_err("refuse before setup").to_string().contains(expected));
+            }
+            assert!(!codex_home.exists(), "validation must precede setup side effects");
+        }
     }
 
     #[test]

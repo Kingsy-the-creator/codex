@@ -113,6 +113,81 @@ impl ResolvedWindowsSandboxPermissions {
         if !self.file_system.can_read_local_path_with_cwd(root, cwd) || root_is_denied {
             anyhow::bail!("elevated Windows sandbox requires effective `:root` read access");
         }
+        // Preserve provenance before setup turns a volume root into profile
+        // children. Direct setup callers do not pass through the resolver.
+        let mut explicit = self.file_system.clone();
+        explicit.entries.retain(|entry| {
+            !(matches!(&entry.path, FileSystemPath::Special { value: Root })
+                && entry.access.can_write())
+        });
+        if explicit
+            .get_writable_roots_with_cwd(cwd)
+            .iter()
+            .any(|root| root.root.as_path().parent().is_none())
+        {
+            anyhow::bail!(
+                "elevated Windows sandbox will not grant explicit filesystem-root writes; request scoped filesystem permissions instead"
+            );
+        }
+        let symbolic_root_write = self.file_system.entries.iter().any(|entry| {
+            matches!(&entry.path, FileSystemPath::Special { value: Root })
+                && entry.access.can_write()
+        });
+        if symbolic_root_write
+            && self.file_system.entries.iter().any(|entry| {
+                matches!(&entry.path, FileSystemPath::GlobPattern { .. })
+                    && !entry.access.can_read()
+            })
+        {
+            // ACL resolution covers existing matches only. A later matching
+            // file would inherit the expanded root's allow ACE.
+            anyhow::bail!(
+                "elevated Windows sandbox cannot combine symbolic `:root` writes with deny-read globs; request scoped filesystem permissions or exact deny paths instead"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validates workload-resolved roots before expansion loses their origin.
+    pub(crate) fn validate_elevated_write_roots(
+        &self,
+        cwd: &Path,
+        env_map: &HashMap<String, String>,
+        overrides: Option<&[PathBuf]>,
+    ) -> Result<()> {
+        self.validate_elevated_filesystem_policy(cwd)?;
+        let mut explicit = self.file_system.clone();
+        resolve_workload_temp_paths(&mut explicit, env_map);
+        explicit.entries.retain(|entry| {
+            !(matches!(&entry.path, FileSystemPath::Special { value: Root })
+                && entry.access.can_write())
+        });
+        anyhow::ensure!(
+            !explicit
+                .get_writable_roots_with_cwd(cwd)
+                .iter()
+                .any(|root| root.root.as_path().parent().is_none()),
+            "elevated Windows sandbox will not grant explicit filesystem-root writes"
+        );
+        let symbolic_root_write = self.file_system.entries.iter().any(|entry| {
+            matches!(&entry.path, FileSystemPath::Special { value: Root })
+                && entry.access.can_write()
+        });
+        for root in overrides.into_iter().flatten() {
+            // Match setup's canonicalisation before deciding whether this is
+            // a root: dot components and junctions can otherwise hide one.
+            let root = crate::path_normalization::canonicalize_path(root);
+            if crate::root_write_expansion::is_filesystem_root(&root) {
+                anyhow::ensure!(
+                    symbolic_root_write
+                        && cwd.ancestors().last().is_some_and(|volume| {
+                            crate::path_normalization::canonical_path_key(volume)
+                                == crate::path_normalization::canonical_path_key(&root)
+                        }),
+                    "elevated Windows sandbox root override requires symbolic `:root` write permission on that volume"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -686,6 +761,92 @@ mod tests {
                 .validate_elevated_filesystem_policy(&cwd)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn elevated_write_roots_preserve_symbolic_provenance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path();
+        let volume = cwd.ancestors().last().expect("volume").to_path_buf();
+        let symbolic = FileSystemSandboxEntry::new(
+            FileSystemPath::Special { value: Root },
+            FileSystemAccessMode::Write,
+        );
+        let explicit = FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(&volume).expect("root").into(),
+            FileSystemAccessMode::Write,
+        );
+        let root_read = FileSystemSandboxEntry::new(
+            FileSystemPath::Special { value: Root },
+            FileSystemAccessMode::Read,
+        );
+        let permissions = |entries| {
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+                &permission_profile_with_entries(entries),
+            )
+            .expect("managed")
+        };
+        let env = HashMap::new();
+        let roots = [volume.clone()];
+        for entries in [
+            vec![root_read.clone(), explicit.clone()],
+            vec![symbolic.clone(), explicit],
+        ] {
+            assert!(permissions(entries).validate_elevated_write_roots(cwd, &env, None).is_err());
+        }
+        assert!(permissions(vec![root_read.clone()])
+            .validate_elevated_write_roots(cwd, &env, Some(&roots)).is_err());
+        let mut root_alias = cwd.to_path_buf();
+        for _ in cwd.ancestors().skip(1) {
+            root_alias.push("..");
+        }
+        assert_eq!(crate::path_normalization::canonicalize_path(&root_alias), volume);
+        assert!(permissions(vec![root_read])
+            .validate_elevated_write_roots(cwd, &env, Some(&[root_alias])).is_err());
+        let allowed = permissions(vec![symbolic.clone()]);
+        allowed.validate_elevated_write_roots(cwd, &env, Some(&roots)).expect("symbolic root override");
+        let other_volume = if volume.to_string_lossy().starts_with('C') { r"D:\" } else { r"C:\" };
+        assert!(allowed.validate_elevated_write_roots(cwd, &env, Some(&[PathBuf::from(other_volume)])).is_err());
+        let temp_write = FileSystemSandboxEntry::new(
+            FileSystemPath::Special { value: FileSystemSpecialPath::Tmpdir },
+            FileSystemAccessMode::Write,
+        );
+        let env = HashMap::from([("TEMP".to_string(), volume.display().to_string())]);
+        assert!(permissions(vec![symbolic, temp_write])
+            .validate_elevated_write_roots(cwd, &env, None).is_err());
+    }
+
+    #[test]
+    fn elevated_root_write_rejects_future_glob_denials() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path();
+        let future = cwd.join("not-created").join("*.env");
+        assert!(!future.exists());
+        let denial = FileSystemSandboxEntry::new(
+            FileSystemPath::GlobPattern { pattern: future.display().to_string() },
+            FileSystemAccessMode::Deny,
+        );
+        let symbolic = FileSystemSandboxEntry::new(
+            FileSystemPath::Special { value: Root },
+            FileSystemAccessMode::Write,
+        );
+        let permissions = |entries| {
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+                &permission_profile_with_entries(entries),
+            ).expect("managed")
+        };
+        let error = permissions(vec![symbolic.clone(), denial.clone()])
+            .validate_elevated_write_roots(cwd, &HashMap::new(), None).expect_err("future glob must be refused");
+        assert!(error.to_string().contains("deny-read globs"));
+        permissions(vec![
+            FileSystemSandboxEntry::new(FileSystemPath::Special { value: Root }, FileSystemAccessMode::Read),
+            FileSystemSandboxEntry::new(AbsolutePathBuf::from_absolute_path(cwd).expect("cwd").into(), FileSystemAccessMode::Write),
+            denial,
+        ]).validate_elevated_write_roots(cwd, &HashMap::new(), None).expect("scoped write unchanged");
+        permissions(vec![symbolic, FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(cwd.join("future-secret")).expect("future path").into(),
+            FileSystemAccessMode::Deny,
+        )]).validate_elevated_write_roots(cwd, &HashMap::new(), None).expect("exact future deny unchanged");
     }
 
     #[test]

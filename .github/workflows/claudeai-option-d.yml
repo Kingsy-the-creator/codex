@@ -108,7 +108,7 @@ jobs:
         shell: pwsh
         run: |
           $failed = $false
-          foreach ($filter in @('setup::', 'acl', 'token')) {
+          foreach ($filter in @('setup::', 'resolved_permissions::tests::', 'acl', 'token')) {
             $out = cargo test -p codex-windows-sandbox --lib $filter 2>&1
             $code = $LASTEXITCODE
             $out | ForEach-Object { Write-Output $_ }
