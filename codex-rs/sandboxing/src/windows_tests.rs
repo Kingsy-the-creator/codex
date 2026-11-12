@@ -64,10 +64,7 @@ fn root_write_with_denied(
     PermissionProfile::from_runtime_permissions(
         &FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry::new(root_entry, FileSystemAccessMode::Write),
-            FileSystemSandboxEntry::new(
-                denied.into(),
-                FileSystemAccessMode::Deny,
-            ),
+            FileSystemSandboxEntry::new(denied.into(), FileSystemAccessMode::Deny),
         ]),
         NetworkSandboxPolicy::Restricted,
     )

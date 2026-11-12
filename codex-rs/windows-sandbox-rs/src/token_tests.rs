@@ -392,13 +392,12 @@ mod caller_isolation {
             let base_raw = base.as_raw_handle() as HANDLE;
             let capability = LocalSid::from_string(CAPABILITY)?;
             let isolated = isolated_token(base_raw, &capability)?;
-            let shared = OwnedHandle::from_raw_handle(
-                create_workspace_write_token_with_caps_and_user_from(
+            let shared =
+                OwnedHandle::from_raw_handle(create_workspace_write_token_with_caps_and_user_from(
                     base_raw,
                     &[capability.as_ptr()],
                     &[],
-                )? as _,
-            );
+                )? as _);
             let logon = crate::winutil::string_from_sid_bytes(&get_logon_sid_bytes(base_raw)?)
                 .map_err(anyhow::Error::msg)?;
             // A signed-in user's process: full access for the user and SYSTEM,
@@ -407,7 +406,11 @@ mod caller_isolation {
             let caller_process = SddlDescriptor::parse(&format!(
                 "O:{CALLER_USER}G:{CALLER_USER}D:(A;;0x{PROCESS_ALL_ACCESS:x};;;{CALLER_USER})(A;;0x{PROCESS_ALL_ACCESS:x};;;SY)(A;;0x{read_execute:x};;;{logon})"
             ))?;
-            for access in [PROCESS_VM_READ, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE] {
+            for access in [
+                PROCESS_VM_READ,
+                PROCESS_QUERY_INFORMATION,
+                PROCESS_TERMINATE,
+            ] {
                 assert!(
                     access_allowed(caller_process.0, &shared, access)?,
                     "model check: the shared-logon token should reach {access:#x}"

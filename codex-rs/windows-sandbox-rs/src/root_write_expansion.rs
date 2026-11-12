@@ -267,8 +267,8 @@ fn token_user_profile() -> Option<PathBuf> {
     unsafe { GetUserProfileDirectoryW(token, std::ptr::null_mut(), &mut len) };
     let mut buffer = vec![0u16; len as usize];
     // SAFETY: `buffer` holds `len` wide characters, as the size query asked.
-    let ok = len != 0
-        && unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut len) } != 0;
+    let ok =
+        len != 0 && unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut len) } != 0;
     // SAFETY: `token` was opened above and is not used after this.
     unsafe { CloseHandle(token) };
     if !ok {

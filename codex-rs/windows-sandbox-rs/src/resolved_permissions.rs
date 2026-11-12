@@ -773,7 +773,9 @@ mod tests {
             FileSystemAccessMode::Write,
         );
         let explicit = FileSystemSandboxEntry::new(
-            AbsolutePathBuf::from_absolute_path(&volume).expect("root").into(),
+            AbsolutePathBuf::from_absolute_path(&volume)
+                .expect("root")
+                .into(),
             FileSystemAccessMode::Write,
         );
         let root_read = FileSystemSandboxEntry::new(
@@ -792,28 +794,56 @@ mod tests {
             vec![root_read.clone(), explicit.clone()],
             vec![symbolic.clone(), explicit],
         ] {
-            assert!(permissions(entries).validate_elevated_write_roots(cwd, &env, None).is_err());
+            assert!(
+                permissions(entries)
+                    .validate_elevated_write_roots(cwd, &env, None)
+                    .is_err()
+            );
         }
-        assert!(permissions(vec![root_read.clone()])
-            .validate_elevated_write_roots(cwd, &env, Some(&roots)).is_err());
+        assert!(
+            permissions(vec![root_read.clone()])
+                .validate_elevated_write_roots(cwd, &env, Some(&roots))
+                .is_err()
+        );
         let mut root_alias = cwd.to_path_buf();
         for _ in cwd.ancestors().skip(1) {
             root_alias.push("..");
         }
-        assert_eq!(crate::path_normalization::canonicalize_path(&root_alias), volume);
-        assert!(permissions(vec![root_read])
-            .validate_elevated_write_roots(cwd, &env, Some(&[root_alias])).is_err());
+        assert_eq!(
+            crate::path_normalization::canonicalize_path(&root_alias),
+            volume
+        );
+        assert!(
+            permissions(vec![root_read])
+                .validate_elevated_write_roots(cwd, &env, Some(&[root_alias]))
+                .is_err()
+        );
         let allowed = permissions(vec![symbolic.clone()]);
-        allowed.validate_elevated_write_roots(cwd, &env, Some(&roots)).expect("symbolic root override");
-        let other_volume = if volume.to_string_lossy().starts_with('C') { r"D:\" } else { r"C:\" };
-        assert!(allowed.validate_elevated_write_roots(cwd, &env, Some(&[PathBuf::from(other_volume)])).is_err());
+        allowed
+            .validate_elevated_write_roots(cwd, &env, Some(&roots))
+            .expect("symbolic root override");
+        let other_volume = if volume.to_string_lossy().starts_with('C') {
+            r"D:\"
+        } else {
+            r"C:\"
+        };
+        assert!(
+            allowed
+                .validate_elevated_write_roots(cwd, &env, Some(&[PathBuf::from(other_volume)]))
+                .is_err()
+        );
         let temp_write = FileSystemSandboxEntry::new(
-            FileSystemPath::Special { value: FileSystemSpecialPath::Tmpdir },
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            },
             FileSystemAccessMode::Write,
         );
         let env = HashMap::from([("TEMP".to_string(), volume.display().to_string())]);
-        assert!(permissions(vec![symbolic, temp_write])
-            .validate_elevated_write_roots(cwd, &env, None).is_err());
+        assert!(
+            permissions(vec![symbolic, temp_write])
+                .validate_elevated_write_roots(cwd, &env, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -823,7 +853,9 @@ mod tests {
         let future = cwd.join("not-created").join("*.env");
         assert!(!future.exists());
         let denial = FileSystemSandboxEntry::new(
-            FileSystemPath::GlobPattern { pattern: future.display().to_string() },
+            FileSystemPath::GlobPattern {
+                pattern: future.display().to_string(),
+            },
             FileSystemAccessMode::Deny,
         );
         let symbolic = FileSystemSandboxEntry::new(
@@ -833,20 +865,39 @@ mod tests {
         let permissions = |entries| {
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(
                 &permission_profile_with_entries(entries),
-            ).expect("managed")
+            )
+            .expect("managed")
         };
         let error = permissions(vec![symbolic.clone(), denial.clone()])
-            .validate_elevated_write_roots(cwd, &HashMap::new(), None).expect_err("future glob must be refused");
+            .validate_elevated_write_roots(cwd, &HashMap::new(), None)
+            .expect_err("future glob must be refused");
         assert!(error.to_string().contains("deny-read globs"));
         permissions(vec![
-            FileSystemSandboxEntry::new(FileSystemPath::Special { value: Root }, FileSystemAccessMode::Read),
-            FileSystemSandboxEntry::new(AbsolutePathBuf::from_absolute_path(cwd).expect("cwd").into(), FileSystemAccessMode::Write),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special { value: Root },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(cwd)
+                    .expect("cwd")
+                    .into(),
+                FileSystemAccessMode::Write,
+            ),
             denial,
-        ]).validate_elevated_write_roots(cwd, &HashMap::new(), None).expect("scoped write unchanged");
-        permissions(vec![symbolic, FileSystemSandboxEntry::new(
-            AbsolutePathBuf::from_absolute_path(cwd.join("future-secret")).expect("future path").into(),
-            FileSystemAccessMode::Deny,
-        )]).validate_elevated_write_roots(cwd, &HashMap::new(), None).expect("exact future deny unchanged");
+        ])
+        .validate_elevated_write_roots(cwd, &HashMap::new(), None)
+        .expect("scoped write unchanged");
+        permissions(vec![
+            symbolic,
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(cwd.join("future-secret"))
+                    .expect("future path")
+                    .into(),
+                FileSystemAccessMode::Deny,
+            ),
+        ])
+        .validate_elevated_write_roots(cwd, &HashMap::new(), None)
+        .expect("exact future deny unchanged");
     }
 
     #[test]
