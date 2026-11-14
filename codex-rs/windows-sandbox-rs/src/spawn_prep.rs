@@ -21,6 +21,7 @@ use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_codex_home_exists;
 use crate::sandbox_utils::inject_git_safe_directory;
+use crate::setup::effective_legacy_write_roots_for_permissions;
 use crate::setup::effective_write_roots_for_permissions;
 use crate::token::LocalSid;
 use crate::token::create_readonly_token_with_cap;
@@ -192,7 +193,8 @@ pub(crate) fn legacy_session_capability_roots(
         .into_iter()
         .collect::<Vec<_>>();
     if permissions.uses_write_capabilities_for_cwd(current_dir, env_map) {
-        effective_write_roots_for_permissions(
+        // The unelevated backend never expands a filesystem-root write root.
+        effective_legacy_write_roots_for_permissions(
             permissions,
             current_dir,
             env_map,
@@ -394,11 +396,8 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     } else {
         Vec::new()
     };
-    let setup_write_roots_override = if uses_write_capabilities {
-        Some(effective_write_roots.as_slice())
-    } else {
-        write_roots_override
-    };
+    // Setup needs the requested roots to recognise filesystem-root expansion
+    // and retain its best-effort grants and deferred-execution protections.
     let sandbox_creds = require_logon_sandbox_creds(
         &permissions,
         cwd,
@@ -406,7 +405,7 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         codex_home,
         read_roots_override,
         read_roots_include_platform_defaults,
-        setup_write_roots_override,
+        write_roots_for_setup,
         deny_read_paths_override,
         if deny_write_paths_override.is_empty() {
             &deny_write_paths

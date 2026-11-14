@@ -1,0 +1,144 @@
+# Validation of option D: approved root-write commands in the elevated
+# (sandbox-account) backend, by expanding a filesystem-root write root into
+# roots the signed-in user controls. Key lines are echoed as annotations,
+# which are public, because raw job logs need a signed-in viewer.
+name: claudeai option D elevated root write
+on:
+  workflow_dispatch:
+  push:
+    branches: [claudeai-option-d]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  windows:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy, rustfmt
+      - name: Enable Git long paths and short Cargo/temp paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_HOME=D:\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path D:\t | Out-Null
+          "TMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=D:\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          cache-on-failure: true
+      # No local Rust toolchain wrote this code, so formatting is reported, not gated.
+      - name: Format report (not a gate)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo fmt -p codex-windows-sandbox -p codex-sandboxing
+          git diff --stat | ForEach-Object { Write-Output "::notice title=rustfmt::$_" }
+          Write-Output '----- RUSTFMT DIFF BEGIN -----'
+          git --no-pager diff
+          Write-Output '----- RUSTFMT DIFF END -----'
+          git checkout -- .
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
+        shell: pwsh
+        run: |
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+      - name: Root-write expansion unit tests (must run and pass)
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-windows-sandbox --lib root_write_expansion::tests:: -- --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $out | Select-String -Pattern '^test |panicked|test result' | Select-Object -First 20 | ForEach-Object { Write-Output "::notice title=expansion::$($_.Line)" }
+          if ($code -ne 0) { exit $code }
+          if (-not ($out -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+      - name: Elevated end-to-end root-write test (must run and pass)
+        if: always()
+        shell: pwsh
+        run: |
+          $name = 'unified_exec::tests::elevated_root_write_keeps_denied_reads_and_process_isolation'
+          # The test points USERPROFILE at a fixture, so it is #[ignore]d and runs alone.
+          $out = cargo test -p codex-windows-sandbox --lib $name -- --ignored --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          # Annotations are capped per step, so join the probe lines into a few.
+          $lines = @($out | ForEach-Object { "$_" })
+          foreach ($pattern in @('PROBE (summary|token)', 'PROBE open', 'PROBE (group|restricted)')) {
+            $joined = (@($lines | Where-Object { $_ -match $pattern }) | ForEach-Object { $_.Trim() }) -join ' | '
+            if ($joined) { Write-Output "::notice title=e2e-probe::$joined" }
+          }
+          $out | Select-String -Pattern '^test |panicked|test result|write ACE|failed' | Select-Object -First 6 | ForEach-Object { Write-Output "::notice title=e2e::$($_.Line)" }
+          if ($code -ne 0) { exit $code }
+          if (-not ($out -match 'test result: ok\. 1 passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+      - name: Existing elevated test (must still pass)
+        if: always()
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-windows-sandbox --lib unified_exec::tests::elevated_non_tty_cmd_forwards_env_output_and_exit -- --exact 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0) { exit $code }
+          if (-not ($out -match 'test result: ok\. 1 passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+      - name: Sandboxing Windows resolver tests
+        if: always()
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-sandboxing --lib windows 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=sandboxing::$($_.Line)" }
+          exit $code
+      - name: Existing setup, ACL and token tests
+        if: always()
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($filter in @('setup::', 'resolved_permissions::tests::', 'acl', 'token')) {
+            $out = cargo test -p codex-windows-sandbox --lib $filter 2>&1
+            $code = $LASTEXITCODE
+            $out | ForEach-Object { Write-Output $_ }
+            $out | Select-String -Pattern 'FAILED|panicked|test result' | Select-Object -First 9 | ForEach-Object { Write-Output "::notice title=existing-${filter}::$($_.Line)" }
+            if ($code -ne 0 -or -not ($out -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
+      - name: Full Windows sandbox suite (reported; four legacy failures pre-date this branch)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = cargo test -p codex-windows-sandbox --lib 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $out | Select-String -Pattern '^test .* FAILED|test result' | Select-Object -First 12 | ForEach-Object { Write-Output "::notice title=full-suite::$($_.Line)" }
+          exit $code
+      - name: Clippy (reported)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = cargo clippy -p codex-windows-sandbox -p codex-sandboxing --tests -- -D warnings 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          $lines = @($out | ForEach-Object { "$_" })
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^(error|warning)') {
+              $where = if ($i + 1 -lt $lines.Count) { $lines[$i + 1].Trim() } else { '' }
+              Write-Output "::warning title=clippy::$($lines[$i]) $where"
+            }
+          }
+          exit $code

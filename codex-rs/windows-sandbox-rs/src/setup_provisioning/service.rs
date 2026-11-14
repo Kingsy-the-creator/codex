@@ -38,6 +38,7 @@ pub fn provision_sandbox_in_process(
         mode: SetupMode::ProvisionOnly,
         runtime,
         refresh_only: false,
+        best_effort_write_roots: Vec::new(),
     };
     run_payload(&payload)?;
     if let Err(err) = crate::setup_error::clear_setup_error_report(codex_home) {

@@ -136,6 +136,7 @@ fn lock_sandbox_dir_blocks_inherited_write_for_runner_files() {
             mode: setup_mode,
             runtime: SetupRuntime::Legacy,
             refresh_only: false,
+            best_effort_write_roots: Vec::new(),
         };
         lock_sandbox_bin_dir(&payload, &sandbox_group_sid).expect("lock sandbox bin");
         let real_sid = resolve_sid(&payload.real_user).expect("resolve real owner SID");

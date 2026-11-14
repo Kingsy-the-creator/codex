@@ -277,6 +277,7 @@ pub fn require_logon_sandbox_creds(
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
 ) -> Result<SandboxCreds> {
+    permissions.validate_elevated_write_roots(command_cwd, env_map, write_roots_override)?;
     let runtime = crate::setup::current_setup_runtime();
     let needed_read = read_roots_override
         .map(<[PathBuf]>::to_vec)
@@ -336,6 +337,7 @@ fn require_sandbox_account_with_setup(
         codex_home,
         proxy_enforced,
     } = request;
+    permissions.validate_elevated_write_roots(command_cwd, env_map, None)?;
     let sandbox_dir = crate::setup::sandbox_dir(codex_home);
     let network_identity = SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced);
     let marker = load_marker(codex_home)?;

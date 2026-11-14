@@ -175,6 +175,9 @@ mod proc_thread_attr;
 mod sandbox_utils;
 
 #[cfg(target_os = "windows")]
+mod root_write_expansion;
+
+#[cfg(target_os = "windows")]
 mod setup;
 
 #[cfg(target_os = "windows")]
@@ -470,11 +473,15 @@ pub use token::TokenGroup;
 #[cfg(target_os = "windows")]
 pub use token::convert_string_sid_to_sid;
 #[cfg(target_os = "windows")]
+pub use token::create_readonly_token_isolated_from_caller_from;
+#[cfg(target_os = "windows")]
 pub use token::create_readonly_token_with_cap_from;
 #[cfg(target_os = "windows")]
 pub use token::create_readonly_token_with_caps_and_user_from;
 #[cfg(target_os = "windows")]
 pub use token::create_readonly_token_with_caps_from;
+#[cfg(target_os = "windows")]
+pub use token::create_workspace_write_token_isolated_from_caller_from;
 #[cfg(target_os = "windows")]
 pub use token::create_workspace_write_token_with_caps_and_user_from;
 #[cfg(target_os = "windows")]
