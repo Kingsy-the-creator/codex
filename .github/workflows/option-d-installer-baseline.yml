@@ -1,0 +1,30 @@
+name: Option D installer baseline diagnostic
+on:
+  push:
+    branches: [codex/option-d-installer-baseline-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare-installer:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare exact baseline and candidate installer fixtures
+        shell: bash
+        env:
+          BASE_COMMIT: d18d77d3b10b268ed1925b8bb612249c414587ef
+          HEAD_COMMIT: eef8136d5e7d3a54d0502e99bd8362eea7dd995e
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_COMMIT" "$HEAD_COMMIT"
+          bash .github/scripts/compare-option-d-installer.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/option-d-installer-comparison"
+      - name: Retain both fixture logs and exact refs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: option-d-installer-baseline-comparison
+          path: ${{ runner.temp }}/option-d-installer-comparison
+          if-no-files-found: error
+          retention-days: 7
