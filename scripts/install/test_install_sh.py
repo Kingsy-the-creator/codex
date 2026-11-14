@@ -426,8 +426,13 @@ class InstallShTest(unittest.TestCase):
                     check=True,
                     capture_output=True,
                 )
+            # Multicall coreutils dispatches by argv[0]. Keep executing the
+            # release-local helper so process scans still protect that release.
+            helper_argv0 = "sleep" if system.sysname == "Linux" else str(helper)
             # A helper can outlive its parent CLI; retain its whole release.
-            with subprocess.Popen([str(helper), "300"]) as running:
+            with subprocess.Popen(
+                [helper_argv0, "300"], executable=str(helper)
+            ) as running:
                 try:
                     second, _ = run_installer_in(
                         root, versions[1], **install_options[versions[1]]
@@ -542,11 +547,15 @@ class InstallShTest(unittest.TestCase):
                             readable, "installer did not attempt retirement"
                         )
                         self.assertEqual(os.read(ready_fd, 128), b"ready\n")
-                        with subprocess.Popen([str(helper), "300"]) as late_helper:
+                        with subprocess.Popen(
+                            [helper_argv0, "300"], executable=str(helper)
+                        ) as late_helper:
                             try:
+                                self.assertIsNone(late_helper.poll())
                                 os.write(resume_fd, b"continue\n")
                                 raced, _ = installing.result(timeout=30)
                                 self.assertEqual(raced.returncode, 0, raced.stderr)
+                                self.assertIsNone(late_helper.poll())
                                 self.assertTrue(oldest.is_dir(), raced.stderr)
                                 self.assertEqual(history.read_bytes(), recorded)
                             finally:

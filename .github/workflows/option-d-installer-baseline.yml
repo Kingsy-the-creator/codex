@@ -8,11 +8,21 @@ permissions:
 jobs:
   compare-installer:
     if: github.event.repository.fork == true
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Compare exact baseline and candidate installer fixtures
+      - name: Record runner tools
+        run: |
+          uname -a
+          python3 --version
+          /bin/sleep --version
+      - name: Diagnose unchanged baseline and original Option D fixtures
+        continue-on-error: true
         shell: bash
         env:
           BASE_COMMIT: d18d77d3b10b268ed1925b8bb612249c414587ef
@@ -20,11 +30,18 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_COMMIT" "$HEAD_COMMIT"
           bash .github/scripts/compare-option-d-installer.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/option-d-installer-comparison"
-      - name: Retain both fixture logs and exact refs
+      - name: Patched fixture must pass without skips
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/option-d-installer-comparison"
+          python3 -I -B -m unittest discover -s scripts/install -p test_install_sh.py -v 2>&1 | tee "$RUNNER_TEMP/option-d-installer-comparison/candidate.log"
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' "$RUNNER_TEMP/option-d-installer-comparison/candidate.log"
+          if grep -Eq '\.\.\. skipped |^OK \(skipped=' "$RUNNER_TEMP/option-d-installer-comparison/candidate.log"; then exit 2; fi
+      - name: Retain all fixture logs and exact refs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: option-d-installer-baseline-comparison
+          name: option-d-installer-comparison-${{ matrix.os }}
           path: ${{ runner.temp }}/option-d-installer-comparison
           if-no-files-found: error
           retention-days: 7
