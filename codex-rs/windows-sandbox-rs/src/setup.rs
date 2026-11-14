@@ -242,7 +242,7 @@ pub fn run_setup_refresh(
     else {
         return Ok(());
     };
-    permissions.validate_elevated_filesystem_policy(command_cwd)?;
+    permissions.validate_elevated_write_roots(command_cwd, env_map, None)?;
     let deny_read_paths =
         setup_refresh_deny_read_paths(permission_profile, workspace_roots, command_cwd)?;
     run_setup_refresh_inner(
@@ -292,7 +292,7 @@ pub fn run_setup_refresh_with_extra_read_roots(
     else {
         return Ok(());
     };
-    permissions.validate_elevated_filesystem_policy(command_cwd)?;
+    permissions.validate_elevated_write_roots(command_cwd, env_map, None)?;
     let deny_read_paths =
         setup_refresh_deny_read_paths(permission_profile, workspace_roots, command_cwd)?;
     let runtime = current_setup_runtime();
@@ -2262,6 +2262,24 @@ mod tests {
             },
             FileSystemAccessMode::Write,
         );
+        // Prove this fixture exercises the old lexical-check bypass, rather
+        // than a path that policy normalisation already turns into a root.
+        let alias_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![root_read.clone(), alias_write.clone()],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+        let alias_permissions =
+            super::ResolvedWindowsSandboxPermissions::try_from_permission_profile(&alias_profile)
+                .expect("managed alias profile");
+        let logical_roots = alias_permissions.writable_roots_for_cwd(cwd, &HashMap::new());
+        assert!(!logical_roots.is_empty(), "fixture must retain an explicit write");
+        assert!(
+            logical_roots.iter().all(|root| root.root.parent().is_some()),
+            "fixture must pass the old lexical root check"
+        );
         for (entries, env) in [
             (vec![root_read.clone(), alias_write.clone()], HashMap::new()),
             (vec![symbolic_write, alias_write], HashMap::new()),
@@ -2283,10 +2301,9 @@ mod tests {
             };
             // Fail a vulnerable build here, before the public entry points
             // could reach an actual setup refresh or apply any ACLs.
-            let permissions = super::ResolvedWindowsSandboxPermissions::try_from_permission_profile(
-                &profile,
-            )
-            .expect("managed profile");
+            let permissions =
+                super::ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile)
+                    .expect("managed profile");
             assert!(
                 permissions
                     .validate_elevated_write_roots(cwd, &env, None)
