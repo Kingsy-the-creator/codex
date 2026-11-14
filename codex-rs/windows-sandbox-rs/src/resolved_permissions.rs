@@ -114,7 +114,8 @@ impl ResolvedWindowsSandboxPermissions {
             anyhow::bail!("elevated Windows sandbox requires effective `:root` read access");
         }
         // Preserve provenance before setup turns a volume root into profile
-        // children. Direct setup callers do not pass through the resolver.
+        // children. Match setup's canonicalisation: a logical junction path
+        // can have a parent while its target is a volume root.
         let mut explicit = self.file_system.clone();
         explicit.entries.retain(|entry| {
             !(matches!(&entry.path, FileSystemPath::Special { value: Root })
@@ -123,7 +124,11 @@ impl ResolvedWindowsSandboxPermissions {
         if explicit
             .get_writable_roots_with_cwd(cwd)
             .iter()
-            .any(|root| root.root.as_path().parent().is_none())
+            .any(|root| {
+                crate::root_write_expansion::is_filesystem_root(
+                    &crate::path_normalization::canonicalize_path(root.root.as_path()),
+                )
+            })
         {
             anyhow::bail!(
                 "elevated Windows sandbox will not grant explicit filesystem-root writes; request scoped filesystem permissions instead"
@@ -166,7 +171,11 @@ impl ResolvedWindowsSandboxPermissions {
             !explicit
                 .get_writable_roots_with_cwd(cwd)
                 .iter()
-                .any(|root| root.root.as_path().parent().is_none()),
+                .any(|root| {
+                    crate::root_write_expansion::is_filesystem_root(
+                        &crate::path_normalization::canonicalize_path(root.root.as_path()),
+                    )
+                }),
             "elevated Windows sandbox will not grant explicit filesystem-root writes"
         );
         let symbolic_root_write = self.file_system.entries.iter().any(|entry| {

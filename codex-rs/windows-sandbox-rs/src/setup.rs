@@ -2221,6 +2221,104 @@ mod tests {
     }
 
     #[test]
+    fn setup_refresh_rejects_junction_root_aliases_before_setup() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path();
+        let volume = cwd.ancestors().last().expect("volume");
+        let alias = cwd.join("volume-alias");
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(volume)
+            .output()
+            .expect("create junction");
+        assert!(output.status.success(), "test setup: {output:?}");
+        assert_eq!(
+            crate::path_normalization::canonical_path_key(&alias),
+            crate::path_normalization::canonical_path_key(volume)
+        );
+        let codex_home = cwd.join("must-not-be-created");
+        let root_read = FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        );
+        let alias_write = FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(&alias)
+                .expect("junction path")
+                .into(),
+            FileSystemAccessMode::Write,
+        );
+        let temp_write = FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            },
+            FileSystemAccessMode::Write,
+        );
+        let symbolic_write = FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Write,
+        );
+        for (entries, env) in [
+            (vec![root_read.clone(), alias_write.clone()], HashMap::new()),
+            (vec![symbolic_write, alias_write], HashMap::new()),
+            (
+                vec![root_read.clone(), temp_write.clone()],
+                HashMap::from([("TEMP".to_string(), alias.display().to_string())]),
+            ),
+            (
+                vec![root_read, temp_write],
+                HashMap::from([("TMP".to_string(), alias.display().to_string())]),
+            ),
+        ] {
+            let profile = PermissionProfile::Managed {
+                file_system: ManagedFileSystemPermissions::Restricted {
+                    entries,
+                    glob_scan_max_depth: None,
+                },
+                network: NetworkSandboxPolicy::Restricted,
+            };
+            // Fail a vulnerable build here, before the public entry points
+            // could reach an actual setup refresh or apply any ACLs.
+            let permissions = super::ResolvedWindowsSandboxPermissions::try_from_permission_profile(
+                &profile,
+            )
+            .expect("managed profile");
+            assert!(
+                permissions
+                    .validate_elevated_write_roots(cwd, &env, None)
+                    .expect_err("reject root alias without setup side effects")
+                    .to_string()
+                    .contains("explicit filesystem-root writes")
+            );
+            for result in [
+                super::run_setup_refresh(&profile, &[], cwd, &env, &codex_home, false),
+                super::run_setup_refresh_with_extra_read_roots(
+                    &profile,
+                    &[],
+                    cwd,
+                    &env,
+                    &codex_home,
+                    Vec::new(),
+                    false,
+                ),
+            ] {
+                assert!(
+                    result
+                        .expect_err("refuse root alias before setup")
+                        .to_string()
+                        .contains("explicit filesystem-root writes")
+                );
+            }
+            assert!(!codex_home.exists(), "validation must precede setup");
+        }
+        fs::remove_dir(&alias).expect("remove junction without touching its target");
+    }
+
+    #[test]
     fn setup_refresh_rejects_root_globs_before_expansion() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
