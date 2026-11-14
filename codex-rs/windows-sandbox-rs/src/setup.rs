@@ -2275,9 +2275,14 @@ mod tests {
             super::ResolvedWindowsSandboxPermissions::try_from_permission_profile(&alias_profile)
                 .expect("managed alias profile");
         let logical_roots = alias_permissions.writable_roots_for_cwd(cwd, &HashMap::new());
-        assert!(!logical_roots.is_empty(), "fixture must retain an explicit write");
         assert!(
-            logical_roots.iter().all(|root| root.root.parent().is_some()),
+            !logical_roots.is_empty(),
+            "fixture must retain an explicit write"
+        );
+        assert!(
+            logical_roots
+                .iter()
+                .all(|root| root.root.parent().is_some()),
             "fixture must pass the old lexical root check"
         );
         for (entries, env) in [
