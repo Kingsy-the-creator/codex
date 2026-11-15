@@ -54,6 +54,9 @@ jobs:
           "TMP=$drive\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TEMP=$drive\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WSB_OUT=$results" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Kept for the experiment step, which compares the two temp locations.
+          "WSB_ORIG_TEMP=$env:TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WSB_SHORT_TEMP=$drive\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           exit 0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -198,6 +201,91 @@ jobs:
           }
           if ($bad -ne 0) { Write-Output "$bad of $($names.Count) re-run tests still did not pass alone."; exit 1 }
           exit 0
+      # The legacy backend runs commands under a restricted token in which the
+      # Administrators group is deny-only (LUA_TOKEN in token.rs). The two steps
+      # below record who the job runs as and how the directories are protected,
+      # then test whether that explains the tests that fail even when run alone.
+      # They run last, so they cannot change any result above.
+      - name: Diagnostics - identity and directory ACLs (read-only)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        shell: pwsh
+        run: |
+          whoami /user
+          whoami /groups
+          $paths = @()
+          $p = (Get-Location).Path
+          while ($p) {
+            $paths += $p
+            $parent = Split-Path -Path $p -Parent
+            if (-not $parent -or $parent -eq $p) { break }
+            $p = $parent
+          }
+          $paths += @($env:WSB_SHORT_TEMP, $env:WSB_ORIG_TEMP)
+          foreach ($path in $paths) {
+            if ($path -and (Test-Path -LiteralPath $path)) {
+              $owner = try { (Get-Acl -LiteralPath $path).Owner } catch { "unknown: $_" }
+              Write-Output "----- ACL of $path (owner: $owner) -----"
+              icacls $path
+            }
+          }
+          exit 0
+      - name: Experiments on tests that still fail alone (default temp dir, then a user ACL entry)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 90
+        shell: pwsh
+        run: |
+          $rerun = Join-Path $env:WSB_OUT 'rerun-results.tsv'
+          if (-not (Test-Path $rerun)) { Write-Output 'No re-run results: nothing to test.'; exit 0 }
+          $names = @(Get-Content -Path $rerun | Where-Object { $_ -and -not $_.StartsWith('PASSED') } | ForEach-Object { ($_ -split "`t")[2] })
+          if ($names.Count -eq 0) { Write-Output 'Every re-run test passed alone: nothing to test.'; exit 0 }
+          $results = Join-Path $env:WSB_OUT 'experiment-results.tsv'
+          $who = (whoami).Trim()
+          $here = (Get-Location).Path
+          $bad = 0
+          $i = 0
+          foreach ($phase in @('default-temp', 'user-acl')) {
+            if ($phase -eq 'default-temp') {
+              # Phase 1 changes one thing: TEMP and TMP go back to the runner's default.
+              $env:TEMP = $env:WSB_ORIG_TEMP
+              $env:TMP = $env:WSB_ORIG_TEMP
+            } else {
+              # Phase 2 keeps the short temp path and gives the signed-in user its own
+              # Modify entry on the checkout and the temp root, as a developer machine has.
+              $env:TEMP = $env:WSB_SHORT_TEMP
+              $env:TMP = $env:WSB_SHORT_TEMP
+              foreach ($root in @($here, $env:WSB_SHORT_TEMP)) {
+                icacls $root /grant "${who}:(OI)(CI)M" /Q
+                if ($LASTEXITCODE -ne 0) { Write-Output "icacls could not grant $who Modify on $root"; exit 1 }
+              }
+            }
+            Write-Output "===== phase ${phase}: TEMP=$env:TEMP ====="
+            foreach ($name in $names) {
+              $i++
+              $base = Join-Path $env:WSB_OUT "experiment-$i"
+              $cargoArgs = @('test', '-p', 'codex-windows-sandbox', '--lib', '--', $name, '--exact', '--nocapture', '--test-threads=1')
+              Write-Output "===== experiment ${phase}: $name ====="
+              $p = Start-Process -FilePath 'cargo' -ArgumentList $cargoArgs -WorkingDirectory $here -NoNewWindow -PassThru -RedirectStandardOutput "$base.out" -RedirectStandardError "$base.err"
+              $null = $p.Handle
+              if ($p.WaitForExit(600000)) {
+                $p.WaitForExit()
+                $code = "$($p.ExitCode)"
+                $out = @(Get-Content -Path "$base.out")
+                if ($code -ne '0') { $status = 'FAILED' }
+                elseif ($out -match 'test result: ok\. 1 passed; 0 failed') { $status = 'PASSED' }
+                else { $status = 'ZERO-TEST' }
+              } else {
+                taskkill /PID $p.Id /T /F
+                $code = 'killed'
+                $status = 'TIMEOUT-10MIN'
+              }
+              foreach ($f in @("$base.err", "$base.out")) { if (Test-Path $f) { Get-Content -Path $f | ForEach-Object { Write-Output $_ } } }
+              Write-Output "===== $status (exit $code) in phase ${phase}: $name ====="
+              Add-Content -Path $results -Value "$status`t$code`t$phase`t$name"
+              if ($status -ne 'PASSED') { $bad++ }
+            }
+          }
+          if ($bad -ne 0) { Write-Output "$bad experiment runs did not pass."; exit 1 }
+          exit 0
       - name: Result summary (lists every failure; changes no outcome)
         if: ${{ !cancelled() }}
         shell: pwsh
@@ -245,8 +333,13 @@ jobs:
               }
             }
           }
-          foreach ($pair in @(@('ignored-results.tsv', 'each ignored lib test alone'), @('rerun-results.tsv', 'full-suite failures re-run alone'))) {
-            $lines += "--- $($pair[1]) (status, exit code, test) ---"
+          $tables = @(
+            @('ignored-results.tsv', 'each ignored lib test alone (status, exit code, test)'),
+            @('rerun-results.tsv', 'full-suite failures re-run alone (status, exit code, test)'),
+            @('experiment-results.tsv', 'experiments on tests that still fail alone (status, exit code, phase, test)')
+          )
+          foreach ($pair in $tables) {
+            $lines += "--- $($pair[1]) ---"
             $file = if ($o) { Join-Path $o $pair[0] } else { '' }
             if ($file -and (Test-Path $file)) { foreach ($row in @(Get-Content -Path $file)) { $lines += "  $row" } }
             else { $lines += '  none recorded' }
