@@ -1,0 +1,395 @@
+# Fork-only: a real windows-latest result for every codex-windows-sandbox test.
+#
+# The upstream workflows target runner groups this fork lacks, so nothing else
+# here runs these Windows-only tests. Modelled on claudeai-option-d.yml: helper
+# binaries are built first, CARGO_BIN_EXE_* point at them, Cargo and temp paths
+# are short, a pass with zero tests is refused, and each #[ignore]d test runs
+# alone with --ignored --exact.
+#
+# No step is continue-on-error. A failing test fails its step and the job; the
+# last step lists every result between two marker lines in the job log.
+#
+# Upstream runs these tests under nextest (one process per test, the `legacy_`
+# tests serialised, one retry). Plain `cargo test` shares one process, so each
+# full-suite failure is also re-run alone to separate interference from a
+# deterministic failure.
+name: claudeai windows sandbox tests
+on:
+  push:
+    branches: [claude/windows-sandbox-test-results-07e8lx]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # Same test environment as upstream rust-ci-full-nextest-platform.yml.
+  RUST_BACKTRACE: "1"
+  RUST_LIB_BACKTRACE: "0"
+  RUST_MIN_STACK: "8388608"
+jobs:
+  windows:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Enable Git long paths and short Cargo/temp paths (Windows)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $drive = if (Test-Path 'D:\') { 'D:' } else { 'C:' }
+          New-Item -ItemType Directory -Force -Path "$drive\t" | Out-Null
+          $results = Join-Path $env:RUNNER_TEMP 'wsb'
+          New-Item -ItemType Directory -Force -Path $results | Out-Null
+          "CARGO_HOME=$drive\ch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$drive\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEMP=$drive\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WSB_OUT=$results" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Kept for the experiment step, which compares the two temp locations.
+          "WSB_ORIG_TEMP=$env:TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WSB_SHORT_TEMP=$drive\t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          cache-on-failure: true
+      - name: Build Windows sandbox helper binaries (as upstream CI does)
+        shell: pwsh
+        run: |
+          cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dbg = Join-Path (Get-Location) 'target\debug'
+          "CARGO_BIN_EXE_codex_windows_sandbox_setup=$dbg\codex-windows-sandbox-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BIN_EXE_codex_command_runner=$dbg\codex-command-runner.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force -Path "$dbg\deps" | Out-Null
+          Copy-Item "$dbg\codex-windows-sandbox-setup.exe", "$dbg\codex-command-runner.exe" -Destination "$dbg\deps\" -Force
+          exit 0
+      - name: Build every test binary of the crate
+        shell: pwsh
+        run: |
+          cargo test -p codex-windows-sandbox --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "WSB_BUILD_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+      - name: List lib tests and the ignored ones (must find both)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        shell: pwsh
+        run: |
+          $all = @(cargo test -p codex-windows-sandbox --lib -- --list | ForEach-Object { "$_" } | Where-Object { $_ -match ': test$' } | ForEach-Object { $_ -replace ': test$', '' })
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ignored = @(cargo test -p codex-windows-sandbox --lib -- --list --ignored | ForEach-Object { "$_" } | Where-Object { $_ -match ': test$' } | ForEach-Object { $_ -replace ': test$', '' })
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "lib tests listed: $($all.Count); ignored: $($ignored.Count)"
+          $ignored | ForEach-Object { Write-Output "ignored: $_" }
+          if ($all.Count -eq 0 -or $ignored.Count -eq 0) { Write-Output 'Refusing an empty test list.'; exit 1 }
+          Set-Content -Path (Join-Path $env:WSB_OUT 'all-tests.txt') -Value $all
+          Set-Content -Path (Join-Path $env:WSB_OUT 'ignored-tests.txt') -Value $ignored
+          exit 0
+      - name: Full lib suite (cargo test -p codex-windows-sandbox --lib)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 60
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:WSB_OUT 'full.log'
+          cargo test -p codex-windows-sandbox --lib 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          Set-Content -Path (Join-Path $env:WSB_OUT 'full.exit') -Value "$code"
+          $text = @(Get-Content -Path $log)
+          $text | Select-String -Pattern '^test .+ \.\.\. FAILED' | Select-Object -First 9 | ForEach-Object { Write-Output "::error title=full-suite::$($_.Line)" }
+          $text | Select-String -Pattern 'test result:' | Select-Object -First 3 | ForEach-Object { Write-Output "::notice title=full-suite::$($_.Line)" }
+          if ($code -ne 0) { exit $code }
+          if (-not ($text -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+          exit 0
+      - name: Each ignored lib test on its own (--ignored --exact)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 90
+        shell: pwsh
+        run: |
+          $list = Join-Path $env:WSB_OUT 'ignored-tests.txt'
+          if (-not (Test-Path $list)) { Write-Output 'No ignored-test list: the listing step did not finish.'; exit 1 }
+          $names = @(Get-Content -Path $list | Where-Object { $_ })
+          $results = Join-Path $env:WSB_OUT 'ignored-results.tsv'
+          $bad = 0
+          $i = 0
+          foreach ($name in $names) {
+            $i++
+            $base = Join-Path $env:WSB_OUT "ignored-$i"
+            $cargoArgs = @('test', '-p', 'codex-windows-sandbox', '--lib', '--', $name, '--ignored', '--exact', '--nocapture', '--test-threads=1')
+            Write-Output "===== ignored test $i of $($names.Count): $name ====="
+            # A hung test must not hide the results of the tests after it.
+            $p = Start-Process -FilePath 'cargo' -ArgumentList $cargoArgs -WorkingDirectory (Get-Location).Path -NoNewWindow -PassThru -RedirectStandardOutput "$base.out" -RedirectStandardError "$base.err"
+            $null = $p.Handle
+            if ($p.WaitForExit(600000)) {
+              $p.WaitForExit()
+              $code = "$($p.ExitCode)"
+              $out = @(Get-Content -Path "$base.out")
+              if ($code -ne '0') { $status = 'FAILED' }
+              elseif ($out -match 'test result: ok\. 1 passed; 0 failed') { $status = 'PASSED' }
+              else { $status = 'ZERO-TEST' }
+            } else {
+              taskkill /PID $p.Id /T /F
+              $code = 'killed'
+              $status = 'TIMEOUT-10MIN'
+            }
+            foreach ($f in @("$base.err", "$base.out")) { if (Test-Path $f) { Get-Content -Path $f | ForEach-Object { Write-Output $_ } } }
+            Write-Output "===== $status (exit $code): $name ====="
+            Add-Content -Path $results -Value "$status`t$code`t$name"
+            if ($status -eq 'PASSED') { Write-Output "::notice title=ignored-alone::PASSED $name" }
+            else { $bad++; Write-Output "::error title=ignored-alone::$status (exit $code) $name" }
+          }
+          if ($names.Count -eq 0) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+          if ($bad -ne 0) { Write-Output "$bad of $($names.Count) ignored tests did not pass."; exit 1 }
+          exit 0
+      - name: Remaining targets (bin unit tests and integration tests)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:WSB_OUT 'nonlib.log'
+          cargo test -p codex-windows-sandbox --bins --test '*' --no-fail-fast 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          Set-Content -Path (Join-Path $env:WSB_OUT 'nonlib.exit') -Value "$code"
+          $text = @(Get-Content -Path $log)
+          $text | Select-String -Pattern '^test .+ \.\.\. FAILED' | Select-Object -First 9 | ForEach-Object { Write-Output "::error title=non-lib::$($_.Line)" }
+          if ($code -ne 0) { exit $code }
+          if (-not ($text -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { Write-Output 'Refusing a zero-test pass.'; exit 1 }
+          exit 0
+      - name: Re-run each full-suite failure alone (separates interference from real failures)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 90
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:WSB_OUT 'full.log'
+          if (-not (Test-Path $log)) { Write-Output 'No full-suite log: nothing to re-run.'; exit 0 }
+          $names = @(Get-Content -Path $log | Select-String -Pattern '^test (.+?)( - should panic)? \.\.\. FAILED' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique)
+          if ($names.Count -eq 0) { Write-Output 'The full suite reported no failed test: nothing to re-run.'; exit 0 }
+          $results = Join-Path $env:WSB_OUT 'rerun-results.tsv'
+          $bad = 0
+          $i = 0
+          foreach ($name in $names) {
+            $i++
+            $base = Join-Path $env:WSB_OUT "rerun-$i"
+            $cargoArgs = @('test', '-p', 'codex-windows-sandbox', '--lib', '--', $name, '--exact', '--nocapture', '--test-threads=1')
+            Write-Output "===== re-run $i of $($names.Count): $name ====="
+            $p = Start-Process -FilePath 'cargo' -ArgumentList $cargoArgs -WorkingDirectory (Get-Location).Path -NoNewWindow -PassThru -RedirectStandardOutput "$base.out" -RedirectStandardError "$base.err"
+            $null = $p.Handle
+            if ($p.WaitForExit(600000)) {
+              $p.WaitForExit()
+              $code = "$($p.ExitCode)"
+              $out = @(Get-Content -Path "$base.out")
+              if ($code -ne '0') { $status = 'FAILED' }
+              elseif ($out -match 'test result: ok\. 1 passed; 0 failed') { $status = 'PASSED' }
+              else { $status = 'ZERO-TEST' }
+            } else {
+              taskkill /PID $p.Id /T /F
+              $code = 'killed'
+              $status = 'TIMEOUT-10MIN'
+            }
+            foreach ($f in @("$base.err", "$base.out")) { if (Test-Path $f) { Get-Content -Path $f | ForEach-Object { Write-Output $_ } } }
+            Write-Output "===== $status (exit $code): $name ====="
+            Add-Content -Path $results -Value "$status`t$code`t$name"
+            if ($status -ne 'PASSED') { $bad++ }
+          }
+          if ($bad -ne 0) { Write-Output "$bad of $($names.Count) re-run tests still did not pass alone."; exit 1 }
+          exit 0
+      # The legacy backend runs commands under a restricted token in which the
+      # Administrators group is deny-only (LUA_TOKEN in token.rs). The two steps
+      # below record who the job runs as and how the directories are protected,
+      # then test whether that explains the tests that fail even when run alone.
+      # They run last, so they cannot change any result above.
+      - name: Diagnostics - identity and directory ACLs (read-only)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        shell: pwsh
+        run: |
+          whoami /user
+          whoami /groups
+          $paths = @()
+          $p = (Get-Location).Path
+          while ($p) {
+            $paths += $p
+            $parent = Split-Path -Path $p -Parent
+            if (-not $parent -or $parent -eq $p) { break }
+            $p = $parent
+          }
+          $paths += @($env:WSB_SHORT_TEMP, $env:WSB_ORIG_TEMP)
+          foreach ($path in $paths) {
+            if ($path -and (Test-Path -LiteralPath $path)) {
+              $owner = try { (Get-Acl -LiteralPath $path).Owner } catch { "unknown: $_" }
+              Write-Output "----- ACL of $path (owner: $owner) -----"
+              icacls $path
+            }
+          }
+          exit 0
+      # Upstream's setup-ci action puts TEMP and TMP on a Dev Drive made by this
+      # script. The last experiment phase below does the same.
+      - name: Experiment setup - provision a Dev Drive with upstream's own script
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          & (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\setup-dev-drive.ps1')
+          exit 0
+      - name: Experiments on tests that still fail alone (four phases, one change each)
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 90
+        shell: pwsh
+        run: |
+          $rerun = Join-Path $env:WSB_OUT 'rerun-results.tsv'
+          if (-not (Test-Path $rerun)) { Write-Output 'No re-run results: nothing to test.'; exit 0 }
+          $names = @(Get-Content -Path $rerun | Where-Object { $_ -and -not $_.StartsWith('PASSED') } | ForEach-Object { ($_ -split "`t")[2] })
+          if ($names.Count -eq 0) { Write-Output 'Every re-run test passed alone: nothing to test.'; exit 0 }
+          $results = Join-Path $env:WSB_OUT 'experiment-results.tsv'
+          $who = (whoami).Trim()
+          $here = (Get-Location).Path
+          $bad = 0
+          $i = 0
+          foreach ($phase in @('default-temp', 'user-acl', 'everyone-temp-acl', 'dev-drive-temp')) {
+            if ($phase -eq 'default-temp') {
+              # Phase 1 changes one thing: TEMP and TMP go back to the runner's default.
+              $env:TEMP = $env:WSB_ORIG_TEMP
+              $env:TMP = $env:WSB_ORIG_TEMP
+            } elseif ($phase -eq 'user-acl') {
+              # Phase 2 keeps the short temp path and gives the signed-in user its own
+              # Modify entry on the checkout and the temp root, as a developer machine has.
+              $env:TEMP = $env:WSB_SHORT_TEMP
+              $env:TMP = $env:WSB_SHORT_TEMP
+              foreach ($root in @($here, $env:WSB_SHORT_TEMP)) {
+                icacls $root /grant "${who}:(OI)(CI)M" /Q
+                if ($LASTEXITCODE -ne 0) { Write-Output "icacls could not grant $who Modify on $root"; exit 1 }
+              }
+            } elseif ($phase -eq 'everyone-temp-acl') {
+              # Phase 3 adds a Modify entry on the temp root for Everyone, one of the
+              # restricting SIDs of the sandbox token (token.rs). The sandbox never grants
+              # its capability SIDs on codex_home, which these tests put under TEMP.
+              $env:TEMP = $env:WSB_SHORT_TEMP
+              $env:TMP = $env:WSB_SHORT_TEMP
+              icacls $env:WSB_SHORT_TEMP /grant "*S-1-1-0:(OI)(CI)M" /Q
+              if ($LASTEXITCODE -ne 0) { Write-Output "icacls could not grant Everyone Modify on $env:WSB_SHORT_TEMP"; exit 1 }
+            } else {
+              # Phase 4 puts TEMP and TMP on the Dev Drive, as upstream's setup-ci does,
+              # and changes no ACL there.
+              if (-not $env:CI_BUILD_ROOT) {
+                Write-Output "===== phase ${phase}: SKIPPED, no Dev Drive was provisioned ====="
+                Add-Content -Path $results -Value "SKIPPED`tnone`t$phase`tall tests (no Dev Drive)"
+                $bad++
+                continue
+              }
+              $devTemp = Join-Path "$env:CI_BUILD_ROOT\" 'tmp'
+              New-Item -ItemType Directory -Force -Path $devTemp | Out-Null
+              $env:TEMP = $devTemp
+              $env:TMP = $devTemp
+              Write-Output "----- ACL of the Dev Drive root -----"
+              icacls "$env:CI_BUILD_ROOT\"
+            }
+            Write-Output "===== phase ${phase}: TEMP=$env:TEMP ====="
+            Write-Output "----- ACL of $env:TEMP in phase $phase -----"
+            icacls $env:TEMP
+            foreach ($name in $names) {
+              $i++
+              $base = Join-Path $env:WSB_OUT "experiment-$i"
+              $cargoArgs = @('test', '-p', 'codex-windows-sandbox', '--lib', '--', $name, '--exact', '--nocapture', '--test-threads=1')
+              Write-Output "===== experiment ${phase}: $name ====="
+              $p = Start-Process -FilePath 'cargo' -ArgumentList $cargoArgs -WorkingDirectory $here -NoNewWindow -PassThru -RedirectStandardOutput "$base.out" -RedirectStandardError "$base.err"
+              $null = $p.Handle
+              if ($p.WaitForExit(600000)) {
+                $p.WaitForExit()
+                $code = "$($p.ExitCode)"
+                $out = @(Get-Content -Path "$base.out")
+                if ($code -ne '0') { $status = 'FAILED' }
+                elseif ($out -match 'test result: ok\. 1 passed; 0 failed') { $status = 'PASSED' }
+                else { $status = 'ZERO-TEST' }
+              } else {
+                taskkill /PID $p.Id /T /F
+                $code = 'killed'
+                $status = 'TIMEOUT-10MIN'
+              }
+              foreach ($f in @("$base.err", "$base.out")) { if (Test-Path $f) { Get-Content -Path $f | ForEach-Object { Write-Output $_ } } }
+              Write-Output "===== $status (exit $code) in phase ${phase}: $name ====="
+              Add-Content -Path $results -Value "$status`t$code`t$phase`t$name"
+              if ($status -ne 'PASSED') { $bad++ }
+            }
+          }
+          if ($bad -ne 0) { Write-Output "$bad experiment runs did not pass."; exit 1 }
+          exit 0
+      - name: Result summary (lists every failure; changes no outcome)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $o = $env:WSB_OUT
+          $lines = @('===== WINDOWS SANDBOX RESULT SUMMARY BEGIN =====')
+          $lines += "commit: $env:GITHUB_SHA"
+          $lines += "runner image: $env:ImageOS $env:ImageVersion"
+          $lines += "test binaries built: $(if ($env:WSB_BUILD_OK -eq '1') { 'yes' } else { 'NO - no test ran' })"
+          $all = @()
+          if ($o -and (Test-Path (Join-Path $o 'all-tests.txt'))) { $all = @(Get-Content -Path (Join-Path $o 'all-tests.txt') | Where-Object { $_ }) }
+          $ignoredNames = @()
+          if ($o -and (Test-Path (Join-Path $o 'ignored-tests.txt'))) { $ignoredNames = @(Get-Content -Path (Join-Path $o 'ignored-tests.txt') | Where-Object { $_ }) }
+          $lines += "lib tests listed: $($all.Count); of which ignored: $($ignoredNames.Count)"
+          foreach ($part in @('full', 'nonlib')) {
+            $log = if ($o) { Join-Path $o "$part.log" } else { '' }
+            $lines += "--- $part suite ---"
+            if (-not $log -or -not (Test-Path $log)) { $lines += "  NO LOG: the $part step did not run"; continue }
+            $text = @(Get-Content -Path $log)
+            $exitFile = Join-Path $o "$part.exit"
+            $lines += "  cargo exit code: $(if (Test-Path $exitFile) { Get-Content -Path $exitFile } else { 'none recorded (step timed out or was killed)' })"
+            $resultLines = @($text | Where-Object { $_ -match 'test result:' })
+            if ($resultLines.Count -eq 0) { $lines += '  NO "test result:" LINE (the test process crashed, hung or never started)' }
+            foreach ($r in $resultLines) { $lines += "  $r" }
+            $okCount = @($text | Where-Object { $_ -match '^test .+ \.\.\. ok$' }).Count
+            $failedLines = @($text | Where-Object { $_ -match '^test .+ \.\.\. FAILED' })
+            $ignoredCount = @($text | Where-Object { $_ -match '^test .+ \.\.\. ignored' }).Count
+            $lines += "  counted from test lines: ok=$okCount FAILED=$($failedLines.Count) ignored=$ignoredCount"
+            foreach ($f in $failedLines) { $lines += "  $f" }
+            if ($part -eq 'full' -and $all.Count -gt 0) {
+              $seen = @{}
+              foreach ($l in $text) { if ($l -match '^test (.+?)( - should panic)? \.\.\. (ok|FAILED|ignored)') { $seen[$Matches[1]] = $true } }
+              $missing = @($all | Where-Object { -not $seen.ContainsKey($_) })
+              $lines += "  listed tests with no result line: $($missing.Count)"
+              foreach ($m in $missing) { $lines += "    NO-RESULT $m" }
+            }
+            for ($j = 0; $j -lt $text.Count; $j++) {
+              if ($text[$j] -match '^---- .+ stdout ----') {
+                $lines += "  $($text[$j])"
+                $end = [Math]::Min($j + 6, $text.Count - 1)
+                for ($k = $j + 1; $k -le $end; $k++) {
+                  if ($text[$k] -match '^---- ') { break }
+                  $lines += "      $($text[$k])"
+                }
+              }
+            }
+          }
+          $tables = @(
+            @('ignored-results.tsv', 'each ignored lib test alone (status, exit code, test)'),
+            @('rerun-results.tsv', 'full-suite failures re-run alone (status, exit code, test)'),
+            @('experiment-results.tsv', 'experiments on tests that still fail alone (status, exit code, phase, test)')
+          )
+          foreach ($pair in $tables) {
+            $lines += "--- $($pair[1]) ---"
+            $file = if ($o) { Join-Path $o $pair[0] } else { '' }
+            if ($file -and (Test-Path $file)) { foreach ($row in @(Get-Content -Path $file)) { $lines += "  $row" } }
+            else { $lines += '  none recorded' }
+          }
+          $lines += '===== WINDOWS SANDBOX RESULT SUMMARY END ====='
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($o) { Set-Content -Path (Join-Path $o 'summary.txt') -Value $lines }
+          $fence = '```'
+          @($fence) + $lines + @($fence) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $short = @($lines | Where-Object { $_ -match 'test result:|^  (PASSED|FAILED|ZERO-TEST|TIMEOUT)' } | ForEach-Object { $_.Trim() -replace "`t", ' ' }) -join ' | '
+          if ($short) { Write-Output "::notice title=windows-sandbox-summary::$short" }
+          exit 0
+      - name: Upload test logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: windows-sandbox-test-logs
+          path: ${{ runner.temp }}/wsb
+          if-no-files-found: warn
