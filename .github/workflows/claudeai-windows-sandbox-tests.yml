@@ -229,7 +229,16 @@ jobs:
             }
           }
           exit 0
-      - name: Experiments on tests that still fail alone (default temp dir, then a user ACL entry)
+      # Upstream's setup-ci action puts TEMP and TMP on a Dev Drive made by this
+      # script. The last experiment phase below does the same.
+      - name: Experiment setup - provision a Dev Drive with upstream's own script
+        if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          & (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\setup-dev-drive.ps1')
+          exit 0
+      - name: Experiments on tests that still fail alone (four phases, one change each)
         if: ${{ !cancelled() && env.WSB_BUILD_OK == '1' }}
         timeout-minutes: 90
         shell: pwsh
@@ -243,12 +252,12 @@ jobs:
           $here = (Get-Location).Path
           $bad = 0
           $i = 0
-          foreach ($phase in @('default-temp', 'user-acl')) {
+          foreach ($phase in @('default-temp', 'user-acl', 'everyone-temp-acl', 'dev-drive-temp')) {
             if ($phase -eq 'default-temp') {
               # Phase 1 changes one thing: TEMP and TMP go back to the runner's default.
               $env:TEMP = $env:WSB_ORIG_TEMP
               $env:TMP = $env:WSB_ORIG_TEMP
-            } else {
+            } elseif ($phase -eq 'user-acl') {
               # Phase 2 keeps the short temp path and gives the signed-in user its own
               # Modify entry on the checkout and the temp root, as a developer machine has.
               $env:TEMP = $env:WSB_SHORT_TEMP
@@ -257,8 +266,33 @@ jobs:
                 icacls $root /grant "${who}:(OI)(CI)M" /Q
                 if ($LASTEXITCODE -ne 0) { Write-Output "icacls could not grant $who Modify on $root"; exit 1 }
               }
+            } elseif ($phase -eq 'everyone-temp-acl') {
+              # Phase 3 adds a Modify entry on the temp root for Everyone, one of the
+              # restricting SIDs of the sandbox token (token.rs). The sandbox never grants
+              # its capability SIDs on codex_home, which these tests put under TEMP.
+              $env:TEMP = $env:WSB_SHORT_TEMP
+              $env:TMP = $env:WSB_SHORT_TEMP
+              icacls $env:WSB_SHORT_TEMP /grant "*S-1-1-0:(OI)(CI)M" /Q
+              if ($LASTEXITCODE -ne 0) { Write-Output "icacls could not grant Everyone Modify on $env:WSB_SHORT_TEMP"; exit 1 }
+            } else {
+              # Phase 4 puts TEMP and TMP on the Dev Drive, as upstream's setup-ci does,
+              # and changes no ACL there.
+              if (-not $env:CI_BUILD_ROOT) {
+                Write-Output "===== phase ${phase}: SKIPPED, no Dev Drive was provisioned ====="
+                Add-Content -Path $results -Value "SKIPPED`tnone`t$phase`tall tests (no Dev Drive)"
+                $bad++
+                continue
+              }
+              $devTemp = Join-Path "$env:CI_BUILD_ROOT\" 'tmp'
+              New-Item -ItemType Directory -Force -Path $devTemp | Out-Null
+              $env:TEMP = $devTemp
+              $env:TMP = $devTemp
+              Write-Output "----- ACL of the Dev Drive root -----"
+              icacls "$env:CI_BUILD_ROOT\"
             }
             Write-Output "===== phase ${phase}: TEMP=$env:TEMP ====="
+            Write-Output "----- ACL of $env:TEMP in phase $phase -----"
+            icacls $env:TEMP
             foreach ($name in $names) {
               $i++
               $base = Join-Path $env:WSB_OUT "experiment-$i"
