@@ -1,0 +1,51 @@
+name: PC validation preparation checks
+on:
+  push:
+    branches: [codex/pc-validation-prep-20261118]
+permissions:
+  contents: read
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+jobs:
+  preparation:
+    if: github.event.repository.fork == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check adversarial log classification
+        shell: pwsh
+        run: |
+          python scripts/test_classify_sandbox_pc_log.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Parse and exercise observation-only preflight
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $script = Join-Path $PWD 'scripts/windows-sandbox-pc-preflight.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { $errors | Format-List; throw 'PowerShell parse failed' }
+          $out = Join-Path $env:RUNNER_TEMP 'pc-validation-preflight'
+          & $script -Repository $PWD -ExpectedCommit $env:GITHUB_SHA -OutputDirectory $out
+          $code = $LASTEXITCODE
+          if ($code -notin @(0, 2)) { throw "Unexpected preflight exit $code" }
+          $record = Get-Content (Join-Path $out 'preflight.json') -Raw | ConvertFrom-Json
+          if ($record.tests_run -ne 0 -or $record.actual_commit -ne $env:GITHUB_SHA) { throw 'Bad preflight record' }
+          if ($record.kind -ne 'preflight_only' -or $record.dirty.Count -ne 0) { throw 'Unexpected preflight scope' }
+          if ($record.elevated_administrator -and $code -ne 2) { throw 'Elevated token was not blocked' }
+          $before = (Get-FileHash (Join-Path $out 'preflight.json')).Hash
+          $refused = $false
+          try { & $script -Repository $PWD -ExpectedCommit $env:GITHUB_SHA -OutputDirectory $out } catch { $refused = $true }
+          if (-not $refused -or (Get-FileHash (Join-Path $out 'preflight.json')).Hash -ne $before) { throw 'Evidence overwrite not refused' }
+          $wrongOut = Join-Path $env:RUNNER_TEMP 'pc-validation-wrong-revision'
+          & $script -Repository $PWD -ExpectedCommit ('0' * 40) -OutputDirectory $wrongOut
+          if ($LASTEXITCODE -ne 2) { throw 'Wrong revision was not blocked' }
+          $wrong = Get-Content (Join-Path $wrongOut 'preflight.json') -Raw | ConvertFrom-Json
+          if (-not ($wrong.blockers -match 'HEAD does not match')) { throw 'Missing wrong-revision reason' }
+          $status = @(git status --porcelain=v1 --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $status.Count -ne 0) { throw 'Preflight changed the checkout' }
+          Write-Output 'Preparation checks passed. No Rust sandbox tests or personal-PC validation ran.'
