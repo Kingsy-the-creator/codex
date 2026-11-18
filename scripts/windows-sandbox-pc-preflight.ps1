@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 if (-not $IsWindows) { throw 'Native Windows PowerShell 7 is required; do not run under WSL.' }
-$git = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+$git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $repo = (Resolve-Path -LiteralPath $Repository).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repo 'codex-rs/windows-sandbox-rs/src/unified_exec/tests.rs') -PathType Leaf)) {
     throw 'Expected repository source is absent.'

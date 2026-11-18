@@ -4,6 +4,8 @@ on:
     branches: [codex/pc-validation-prep-20261118]
 permissions:
   contents: read
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
 jobs:
   preparation:
     if: github.event.repository.fork == true
