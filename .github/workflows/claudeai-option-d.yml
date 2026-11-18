@@ -116,7 +116,7 @@ jobs:
             if ($code -ne 0 -or -not ($out -match 'test result: ok\. [1-9][0-9]* passed; 0 failed')) { $failed = $true }
           }
           if ($failed) { exit 1 }
-      - name: Full Windows sandbox suite (reported; four legacy failures pre-date this branch)
+      - name: Full Windows sandbox suite (report-only; inspect every failure)
         if: always()
         continue-on-error: true
         shell: pwsh
