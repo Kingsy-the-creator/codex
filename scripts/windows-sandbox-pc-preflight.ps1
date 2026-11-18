@@ -26,7 +26,9 @@ if ($out.Equals($repo, [StringComparison]::OrdinalIgnoreCase) -or
 }
 $head = (& $git -C $repo rev-parse HEAD 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed: $head" }
-$dirty = @(& $git -C $repo status --porcelain=v1 --untracked-files=all 2>&1)
+# --no-optional-locks: plain `git status` may rewrite .git/index and hold index.lock, which
+# can break another agent's concurrent git command in the same checkout.
+$dirty = @(& $git --no-optional-locks -C $repo status --porcelain=v1 --untracked-files=all 2>&1)
 if ($LASTEXITCODE -ne 0) { throw 'git status failed.' }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)

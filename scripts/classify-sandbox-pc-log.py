@@ -15,7 +15,23 @@ TESTS = {
 }
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 STAMP = re.compile(r'^\d{4}-\d\d-\d\dT\S+Z ')
-SUMMARY = re.compile(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;')
+SUMMARY = re.compile(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;(?: finished in (\d+(?:\.\d+)?)s)?')
+# The TTY test's only early return (pwsh_path() is None) passes almost instantly, and libtest
+# hides its skip text unless --nocapture is used. Its real body starts several sandboxed
+# PowerShell processes, so a pass faster than this floor cannot have exercised it.
+TTY_MIN_SECONDS = 0.25
+
+
+def read_log(path):
+    """Return a captured log as text without crashing triage on its encoding.
+
+    Windows PowerShell 5.1 redirection writes UTF-16 with a byte-order mark; PowerShell 7
+    writes UTF-8. Undecodable bytes become U+FFFD so a damaged log is still classified.
+    """
+    data = Path(path).read_bytes()
+    if data.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return data.decode('utf-16', errors='replace')
+    return data.decode('utf-8-sig', errors='replace')
 
 
 def classify(text, kind, exit_code, timed_out=False):
@@ -35,7 +51,7 @@ def classify(text, kind, exit_code, timed_out=False):
     elif len(summaries) != 1 or len(starts) != 1 or invocations != ['running 1 test']:
         result.update(classification='INVALID_SCOPE', reasons=['Need one exact named test and one final summary from one invocation.'])
     else:
-        status, passed, failed, ignored, measured, _ = summaries[0]
+        status, passed, failed, ignored, measured, _, seconds = summaries[0]
         counts = tuple(map(int, (passed, failed, ignored, measured)))
         if exit_code is None:
             result['reasons'] = ['The native exit code was not captured.']
@@ -47,6 +63,8 @@ def classify(text, kind, exit_code, timed_out=False):
             result.update(classification='PREREQUISITE_OR_SKIP', reasons=['Output mentions a skip; do not count it as exercised coverage.'])
         elif kind == 'capture' and not all(any(marker in line for line in lines) for marker in ('capture pwsh codex_home=', 'capture pwsh exit_code=0', 'capture pwsh timed_out=false')):
             result.update(classification='BODY_UNCONFIRMED', reasons=['Capture-body evidence is missing even though the harness reports a pass.'])
+        elif kind == 'tty' and (seconds is None or float(seconds) < TTY_MIN_SECONDS):
+            result.update(classification='BODY_UNCONFIRMED', reasons=[f'The TTY pass has no duration or finished in under {TTY_MIN_SECONDS}s, which fits the missing-PowerShell early return (its skip text is hidden unless --nocapture is used), not the lifecycle body.'])
         else:
             result.update(classification='REPORTED_PASS', reasons=['One exact harness test reports success.'])
             if kind == 'tty':
@@ -61,7 +79,7 @@ def main():
     parser.add_argument('--exit-code', type=int)
     parser.add_argument('--timed-out', action='store_true')
     args = parser.parse_args()
-    result = classify(args.log.read_text(encoding='utf-8-sig'), args.test, args.exit_code, args.timed_out)
+    result = classify(read_log(args.log), args.test, args.exit_code, args.timed_out)
     print(json.dumps(result, indent=2))
     return 0 if result['classification'] == 'REPORTED_PASS' else 2
 
